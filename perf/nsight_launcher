@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# JSON extraction example:
+#   ./nsight_summary.py logs/nsight/[log-name].sqlite \
+#     --format json \
+#     --limit 20 \
+#     --out logs/nsight/[output-name].json
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_NSYS="/usr/local/cuda-12.9/bin/nsys"
+DEFAULT_PYTHON="/data/esca/uckim/miniconda3/envs/vllm_hetero/bin/python"
+
+NSYS_BIN="${NSYS_BIN:-${DEFAULT_NSYS}}"
+PYTHON_BIN="${VLLM_HETERO_PYTHON:-${PYTHON_BIN:-${DEFAULT_PYTHON}}}"
+LAUNCHER="${LAUNCHER:-${SCRIPT_DIR}/run_vllm_launcher}"
+
+TARGET="${TARGET:-llama8b}"
+HOST_FOR_CLIENT="${HOST_FOR_CLIENT:-127.0.0.1}"
+PORT="${PORT:-28000}"
+BASE_URL="${VLLM_BASE_URL:-http://${HOST_FOR_CLIENT}:${PORT}/v1}"
+HEALTH_URL="${HEALTH_URL:-http://${HOST_FOR_CLIENT}:${PORT}/health}"
+
+STAMP="$(date +%Y%m%d_%H%M%S)"
+NSIGHT_OUT_DIR="${NSIGHT_OUT_DIR:-${SCRIPT_DIR}/logs/nsight}"
+NSYS_SESSION="${NSYS_SESSION:-vllmprof_${STAMP}_$$}"
+NSYS_TRACE="${NSYS_TRACE:-cuda,nvtx,cublas,cudnn,osrt}"
+NSYS_DURATION="${NSYS_DURATION:-300}"
+NSYS_STATS="${NSYS_STATS:-0}"
+NSYS_TRACE_FORK_BEFORE_EXEC="${NSYS_TRACE_FORK_BEFORE_EXEC:-true}"
+NSIGHT_DETAILED="${NSIGHT_DETAILED:-1}"
+NSYS_EXPORT_SQLITE="${NSYS_EXPORT_SQLITE:-1}"
+
+STOP_BEFORE="${STOP_BEFORE:-1}"
+STOP_AFTER="${STOP_AFTER:-0}"
+WAIT_TIMEOUT="${WAIT_TIMEOUT:-240}"
+
+WARMUP_MAX_TOKENS="${WARMUP_MAX_TOKENS:-8}"
+WARMUP_REQUESTS="${WARMUP_REQUESTS:-1}"
+WARMUP_RUNS="${WARMUP_RUNS:-1}"
+RUN_WARMUP="${RUN_WARMUP:-1}"
+
+PERF_MAX_TOKENS="${PERF_MAX_TOKENS:-1024}"
+PERF_MIN_TOKENS="${PERF_MIN_TOKENS:-${PERF_MAX_TOKENS}}"
+PERF_REQUESTS="${PERF_REQUESTS:-100}"
+PERF_RUNS="${PERF_RUNS:-1}"
+PERF_IGNORE_EOS="${PERF_IGNORE_EOS:-1}"
+PERF_EXTRA_ARGS="${PERF_EXTRA_ARGS:-}"
+NSYS_EXTRA_ARGS="${NSYS_EXTRA_ARGS:-}"
+
+profile_pid=""
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./nsight_launcher [launcher start args...]
+
+Default flow:
+  1. stop current vLLM/Ray
+  2. start vLLM under Nsight Systems with delayed capture
+  3. wait for /health
+  4. run a small warmup
+  5. start capture, run performance.py, stop capture
+
+Common examples:
+  ./nsight_launcher
+  TARGET=llama70b ./nsight_launcher
+  MODEL=meta-llama/Llama-3.1-8B-Instruct ./nsight_launcher
+  PERF_MAX_TOKENS=256 PERF_REQUESTS=4 PERF_RUNS=2 ./nsight_launcher
+  NSIGHT_DETAILED=1 PERF_REQUESTS=1 PERF_MAX_TOKENS=16 ./nsight_launcher
+  ./nsight_launcher --set EXECUTOR_BACKEND=mp --set ASYNC_SCHEDULING=1
+  ./nsight_launcher --set MAX_NUM_SEQS=16 --set MAX_NUM_BATCHED_TOKENS=2048
+
+Useful env:
+  NSYS_BIN              path to nsys
+  VLLM_HETERO_PYTHON    python used for performance.py
+  TARGET                launcher target if --target is not passed (default: llama8b)
+  MODEL                 model passed to vLLM (default: target-specific preset)
+  PORT                  server port for health/performance defaults (default: 28000)
+  NSIGHT_OUT_DIR         output directory (default: logs/nsight)
+  NSIGHT_OUT_BASE        output path without extension
+  NSYS_DURATION          max collection/session seconds (default: 300)
+  NSYS_TRACE             trace list (default: cuda,nvtx,cublas,cudnn,osrt)
+  NSYS_TRACE_FORK_BEFORE_EXEC
+                         trace fork-before-exec children for mp profiling (default: true)
+  NSYS_EXPORT_SQLITE     also export .sqlite for CLI analysis (default: 0)
+  NSYS_STATS             run nsys stats at capture end (default: 0)
+  NSIGHT_DETAILED        enable vLLM layerwise NVTX + eager mode (default: 0)
+  STOP_BEFORE            stop existing server before launch (default: 1)
+  STOP_AFTER             stop server after profiling (default: 0)
+  RUN_WARMUP             run warmup before capture (default: 1)
+  PERF_MAX_TOKENS        measured max tokens (default: 1024)
+  PERF_MIN_TOKENS        measured min tokens (default: PERF_MAX_TOKENS)
+  PERF_REQUESTS          measured request concurrency (default: 100)
+  PERF_RUNS              measured repeated batches (default: 1)
+  PERF_IGNORE_EOS        pass --ignore-eos when true (default: 1)
+  PERF_EXTRA_ARGS        extra args appended to performance.py
+  NSYS_EXTRA_ARGS        extra args appended to nsys profile
+
+Outputs:
+  ${NSIGHT_OUT_DIR}/vllm_<target>_<timestamp>.nsys-rep
+  ${NSIGHT_OUT_DIR}/vllm_<target>_<timestamp>.sqlite  (only when NSYS_EXPORT_SQLITE=1)
+USAGE
+}
+
+is_true() {
+  case "${1,,}" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+has_target_arg() {
+  local arg
+  for arg in "$@"; do
+    if [[ "${arg}" == "--target" || "${arg}" == --target=* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+target_from_args() {
+  local arg prev
+  prev=""
+  for arg in "$@"; do
+    if [[ "${prev}" == "--target" ]]; then
+      printf '%s\n' "${arg}"
+      return 0
+    fi
+    if [[ "${arg}" == --target=* ]]; then
+      printf '%s\n' "${arg#--target=}"
+      return 0
+    fi
+    prev="${arg}"
+  done
+  printf '%s\n' "${TARGET}"
+}
+
+default_model_for_target() {
+  case "$1" in
+    llama8b) printf '%s\n' "meta-llama/Llama-3.1-8B-Instruct" ;;
+    llama70b) printf '%s\n' "meta-llama/Llama-3.3-70B-Instruct" ;;
+    llama405b) printf '%s\n' "meta-llama/Llama-3.1-405B-Instruct-FP8" ;;
+    qwen235b) printf '%s\n' "Qwen/Qwen3-235B-A22B" ;;
+    *) printf '%s\n' "meta-llama/Llama-3.1-8B-Instruct" ;;
+  esac
+}
+
+has_model_override_arg() {
+  local arg prev
+  prev=""
+  for arg in "$@"; do
+    if [[ "${prev}" == "--set" && "${arg}" == MODEL=* ]]; then
+      return 0
+    fi
+    if [[ "${arg}" == --set=MODEL=* ]]; then
+      return 0
+    fi
+    prev="${arg}"
+  done
+  return 1
+}
+
+has_set_key_arg() {
+  local key arg prev
+  key="$1"
+  shift
+  prev=""
+  for arg in "$@"; do
+    if [[ "${prev}" == "--set" && "${arg}" == "${key}="* ]]; then
+      return 0
+    fi
+    if [[ "${arg}" == --set=${key}=* ]]; then
+      return 0
+    fi
+    prev="${arg}"
+  done
+  return 1
+}
+
+add_start_set_if_missing() {
+  local key value
+  key="$1"
+  value="$2"
+  shift 2
+  if ! has_set_key_arg "${key}" "$@"; then
+    start_cmd+=(--set "${key}=${value}")
+  fi
+}
+
+model_from_args() {
+  local arg prev
+  prev=""
+  for arg in "$@"; do
+    if [[ "${prev}" == "--set" && "${arg}" == MODEL=* ]]; then
+      printf '%s\n' "${arg#MODEL=}"
+      return 0
+    fi
+    if [[ "${arg}" == --set=MODEL=* ]]; then
+      printf '%s\n' "${arg#--set=MODEL=}"
+      return 0
+    fi
+    prev="${arg}"
+  done
+  return 1
+}
+
+wait_for_server() {
+  local deadline now
+  deadline=$((SECONDS + WAIT_TIMEOUT))
+  printf '[INFO] Waiting for server: %s\n' "${HEALTH_URL}"
+  until curl -fsS "${HEALTH_URL}" >/dev/null 2>&1; do
+    now="${SECONDS}"
+    if (( now >= deadline )); then
+      printf '[ERROR] Timed out waiting for server after %ss\n' "${WAIT_TIMEOUT}" >&2
+      printf '[INFO] Check log: %s\n' "${SCRIPT_DIR}/logs/master.log" >&2
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+cleanup() {
+  if [[ -n "${profile_pid}" ]] && kill -0 "${profile_pid}" >/dev/null 2>&1; then
+    "${NSYS_BIN}" stop --session="${NSYS_SESSION}" >/dev/null 2>&1 || true
+    wait "${profile_pid}" || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ ! -x "${NSYS_BIN}" ]]; then
+  if command -v nsys >/dev/null 2>&1; then
+    NSYS_BIN="$(command -v nsys)"
+  else
+    printf '[ERROR] nsys not found. Set NSYS_BIN or add nsys to PATH.\n' >&2
+    exit 1
+  fi
+fi
+
+mkdir -p "${NSIGHT_OUT_DIR}"
+
+EFFECTIVE_TARGET="$(target_from_args "$@")"
+ARG_MODEL="$(model_from_args "$@" || true)"
+MODEL="${ARG_MODEL:-${MODEL:-$(default_model_for_target "${EFFECTIVE_TARGET}")}}"
+NSIGHT_OUT_BASE="${NSIGHT_OUT_BASE:-${NSIGHT_OUT_DIR}/vllm_${EFFECTIVE_TARGET}_${STAMP}}"
+
+start_cmd=("${LAUNCHER}" start)
+if ! has_target_arg "$@"; then
+  start_cmd+=(--target "${EFFECTIVE_TARGET}")
+fi
+if ! has_model_override_arg "$@"; then
+  start_cmd+=(--set "MODEL=${MODEL}")
+fi
+if is_true "${NSIGHT_DETAILED}"; then
+  add_start_set_if_missing "ENABLE_LAYERWISE_NVTX_TRACING" "1" "$@"
+  add_start_set_if_missing "ENFORCE_EAGER" "1" "$@"
+  add_start_set_if_missing "VLLM_NVTX_SCOPES_FOR_PROFILING" "0" "$@"
+fi
+start_cmd+=("$@")
+
+# shellcheck disable=SC2206
+nsys_extra_args=(${NSYS_EXTRA_ARGS})
+# shellcheck disable=SC2206
+perf_extra_args=(${PERF_EXTRA_ARGS})
+
+printf '[INFO] Nsight session: %s\n' "${NSYS_SESSION}"
+printf '[INFO] Nsight output:  %s.nsys-rep\n' "${NSIGHT_OUT_BASE}"
+printf '[INFO] Target:         %s\n' "${EFFECTIVE_TARGET}"
+printf '[INFO] Model:          %s\n' "${MODEL}"
+if is_true "${NSYS_EXPORT_SQLITE}"; then
+  printf '[INFO] SQLite export:  enabled\n'
+fi
+if is_true "${NSIGHT_DETAILED}"; then
+  printf '[INFO] Detailed mode:  layerwise NVTX + eager execution\n'
+fi
+printf '[INFO] Launcher cmd:  '
+printf ' %q' "${start_cmd[@]}"
+printf '\n'
+
+printf '[INFO] Preflight launcher dry-run\n'
+"${LAUNCHER}" start --dry-run "${start_cmd[@]:2}"
+
+if is_true "${STOP_BEFORE}"; then
+  "${LAUNCHER}" stop || true
+fi
+
+nsys_profile_cmd=(
+  "${NSYS_BIN}" profile
+  -t "${NSYS_TRACE}"
+  --sample=none
+  --cpuctxsw=none
+  --cuda-graph-trace=graph
+  --trace-fork-before-exec="${NSYS_TRACE_FORK_BEFORE_EXEC}"
+  --force-overwrite=true
+  --stop-on-exit=false
+  --kill=none
+  --wait=all
+  --duration="${NSYS_DURATION}"
+  --start-later=true
+  --session-new="${NSYS_SESSION}"
+)
+if is_true "${NSYS_EXPORT_SQLITE}"; then
+  nsys_profile_cmd+=(--export=sqlite)
+fi
+if is_true "${NSYS_STATS}"; then
+  nsys_profile_cmd+=(--stats=true)
+fi
+nsys_profile_cmd+=(
+  -o "${NSIGHT_OUT_BASE}"
+  "${nsys_extra_args[@]}"
+  "${start_cmd[@]}"
+)
+
+"${nsys_profile_cmd[@]}" &
+profile_pid=$!
+
+wait_for_server
+
+if is_true "${RUN_WARMUP}"; then
+  printf '[INFO] Warmup: max_tokens=%s requests=%s runs=%s\n' \
+    "${WARMUP_MAX_TOKENS}" "${WARMUP_REQUESTS}" "${WARMUP_RUNS}"
+  VLLM_BASE_URL="${BASE_URL}" \
+    "${PYTHON_BIN}" "${SCRIPT_DIR}/performance.py" \
+    --max-tokens "${WARMUP_MAX_TOKENS}" \
+    --requests "${WARMUP_REQUESTS}" \
+    --runs "${WARMUP_RUNS}"
+fi
+
+printf '[INFO] Starting Nsight capture\n'
+"${NSYS_BIN}" start --session="${NSYS_SESSION}"
+
+perf_cmd=(
+  "${PYTHON_BIN}" "${SCRIPT_DIR}/performance.py"
+  --max-tokens "${PERF_MAX_TOKENS}"
+  --min-tokens "${PERF_MIN_TOKENS}"
+  --requests "${PERF_REQUESTS}"
+  --runs "${PERF_RUNS}"
+  "${perf_extra_args[@]}"
+)
+if is_true "${PERF_IGNORE_EOS}"; then
+  perf_cmd+=(--ignore-eos)
+fi
+
+printf '[INFO] Profile workload: %q' "${perf_cmd[@]}"
+printf '\n'
+VLLM_BASE_URL="${BASE_URL}" "${perf_cmd[@]}"
+
+printf '[INFO] Stopping Nsight capture\n'
+"${NSYS_BIN}" stop --session="${NSYS_SESSION}"
+wait "${profile_pid}"
+profile_pid=""
+
+printf '[INFO] Nsight files:\n'
+find "${NSIGHT_OUT_DIR}" -maxdepth 1 -type f \
+  \( -name "$(basename "${NSIGHT_OUT_BASE}").nsys-rep" -o -name "$(basename "${NSIGHT_OUT_BASE}").sqlite" \) \
+  -print | sort
+
+if is_true "${STOP_AFTER}"; then
+  "${LAUNCHER}" stop || true
+fi

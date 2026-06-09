@@ -1,0 +1,28 @@
+# Site-specific cluster config — copy cluster.example.env to cluster.local.env
+cluster.local.env
+
+# Sweep outputs and intermediate cells
+results/*
+!results/final/
+!results/final/**
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Logs / temp
+logs/
+*.log
+/tmp/*.out
+nohup.out
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
