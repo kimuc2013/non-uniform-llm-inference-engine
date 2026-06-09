@@ -25,7 +25,8 @@ planner/            ★ main entry points
   planner.py / cost_model.py / scorer.py / model_spec.py / workload.py / gpu_library.py
   network_library.py / hetero_eval.py / run_eval.py / cli.py
 asim_etgen/         ASTRA-sim execution-trace generator for the same workloads
-results/final/      committed: aggregated CSVs + plots (no intermediate cells)
+results/final/      committed: aggregated CSVs (no intermediate cells)
+figures/            committed: matplotlib figures from the 4+4 sweeps
 ```
 
 ## Setup
@@ -54,7 +55,7 @@ python planner/cluster_setup_4x4.py       # idempotent — restart if not 4+4
 
 Aggregate + plot:
 ```bash
-python planner/plot_4x4_results.py        # writes results/final/plots/*.png
+python planner/plot_4x4_results.py        # writes figures/*.png
 ```
 
 ## Single sweep cell (for debugging)

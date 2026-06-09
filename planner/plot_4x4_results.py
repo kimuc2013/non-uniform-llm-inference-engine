@@ -192,7 +192,7 @@ def plot_heatmap(grid, configs, model_name, out_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default=str(REPO / "results" / "plots_4x4"))
+    ap.add_argument("--out", default=str(REPO / "figures"))
     args = ap.parse_args()
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
 
