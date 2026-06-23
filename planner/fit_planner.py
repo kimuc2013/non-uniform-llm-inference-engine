@@ -1,6 +1,6 @@
 """Fit the planner's free parameters to calibration_data.csv.
 
-Free parameters (7):
+Free parameters (8):
   ar_latency_us       cross-node per-hop AllReduce latency
   ar_bw_gbs           cross-node AR algorithm bandwidth
   intra_ar_latency_us intra-node per-hop latency
@@ -8,9 +8,10 @@ Free parameters (7):
   c_mb_ms             per-microbatch dispatch cost
   c_chunk_ms          per-prefill-chunk overhead
   overlap_eta         PP overlap efficiency
+  prefill_overlap     ρ: prefill/decode resource-overlap fraction (wall blend)
 
-Fixed (anchored from physical derivation in hw_params.json):
-  GPU membw / tflops, p2p, mem capacities.
+Fixed (anchored from physical derivation in hw_params.json, NOT fitted):
+  GPU membw / tflops, p2p, mem capacities, prefill_ar_overlap, NVLink intra-AR.
 
 Loss: median-of-relative-errors (robust to outliers like qwen TP8 cells).
 Validation: leave-one-model-out (fit on 3 models, test on held-out model).
@@ -28,6 +29,12 @@ sys.path.insert(0, str(HERE.parent))
 import planner.perf_planner as P
 
 
+N_REQ_MAX = 100  # hard operating rule: above this the Ada small-partition rank
+                 # OOMs → KV preemption/recompute thrashing, an unsupported
+                 # regime the planner does not (and should not) model. Old
+                 # n=128 sweeps predate this rule; exclude them from the fit.
+
+
 def load_rows():
     rows = []
     for row in csv.DictReader(open(P.CALIB_CSV)):
@@ -36,6 +43,8 @@ def load_rows():
         if row.get("regime") == "stock":
             continue
         if float(row["tps"]) <= 0:
+            continue
+        if int(row["n_req"]) > N_REQ_MAX:
             continue
         rows.append(row)
     return rows
@@ -103,7 +112,7 @@ def eval_params(x, rows, return_detail=False):
             terms.append(0.5 * abs(rel_ttft))
         errs.append(float(np.mean(terms)))
         detail.append((row["model"], row["label"], row["workload"],
-                       meas_tps, r["tps"], rel_tps))
+                       meas_tps, r["tps"], rel_tps, int(row["n_req"])))
     if return_detail:
         return errs, detail
     if not errs:
@@ -113,8 +122,11 @@ def eval_params(x, rows, return_detail=False):
 
 def fit(rows):
     bounds = [
-        (50, 500),      # ar_latency_us
-        (2, 30),        # ar_bw_gbs
+        (5, 500),       # ar_latency_us (inter-node IB; hierarchical AR now
+                        #   charges only 2(n_nodes-1) of these, so it can be
+                        #   well below the old 50us floor)
+        (1, 30),        # ar_bw_gbs (effective cross-node AR bw; decode AR runs
+                        #   far below peak IB)
         (5, 200),       # intra_ar_latency_us
         (0, 80),        # step_floor_ms
         (0, 20),        # c_mb_ms
@@ -144,20 +156,24 @@ def main():
 
     errs, detail = eval_params(x, rows, return_detail=True)
     by_model = {}
-    for mkey, label, wl, meas, pred, rel in detail:
+    for mkey, label, wl, meas, pred, rel, nr in detail:
         by_model.setdefault(mkey, []).append(abs(rel))
     print("\n  MAPE per model (global fit):")
     for mkey, lst in sorted(by_model.items()):
         print(f"    {mkey:10s} n={len(lst):3d} MAPE={100*np.mean(lst):6.1f}%  "
               f"median={100*np.median(lst):6.1f}%")
 
-    # Champion match + regret
-    print("\n  champion match + regret (regret = measured loss of picking predicted champ):")
+    # Champion match + regret. Group by (model, workload, n_req): with the
+    # concurrency axis in the data the champion CROSSES OVER with n_req (TP8 at
+    # low load → TP4PP2 at high load), so lumping n_req would compare configs
+    # that win at different operating points and is meaningless.
+    print("\n  champion match + regret per (model, workload, n_req):")
     by_mw = {}
-    for mkey, label, wl, meas, pred, rel in detail:
-        by_mw.setdefault((mkey, wl), []).append((label, meas, pred))
+    for mkey, label, wl, meas, pred, rel, nr in detail:
+        by_mw.setdefault((mkey, wl, nr), []).append((label, meas, pred))
     match = 0; total = 0; regrets = []; top3 = 0; rhos = []
-    for (mkey, wl), lst in sorted(by_mw.items()):
+    reg_by_n = {}
+    for (mkey, wl, nr), lst in sorted(by_mw.items()):
         mc, mc_tps, _ = max(lst, key=lambda t: t[1])
         pc, _, _ = max(lst, key=lambda t: t[2])
         pc_meas = next(meas for lab, meas, _ in lst if lab == pc)
@@ -169,16 +185,20 @@ def main():
         pred_top3 = {lab for lab, _, _ in sorted(lst, key=lambda t: -t[2])[:3]}
         in_top3 = mc in pred_top3
         top3 += in_top3
-        # Spearman rank-corr of predicted vs measured tps over this cell set
         if len(lst) >= 3:
             rho = spearmanr([t[1] for t in lst], [t[2] for t in lst]).correlation
             if not math.isnan(rho):
                 rhos.append(rho)
-        print(f"    {'✓' if ok else '✗'} {mkey:10s} {wl:14s} meas={mc[:28]:28s} "
-              f"pred={pc[:28]:28s} regret={regret:5.1f}% top3={'Y' if in_top3 else 'n'}")
+        reg_by_n.setdefault(nr, []).append((ok, regret))
+        if not ok:   # print only misses to keep output readable
+            print(f"    ✗ {mkey:10s} {wl:13s} n={nr:>3d} meas={mc[:24]:24s} "
+                  f"pred={pc[:24]:24s} regret={regret:5.1f}% top3={'Y' if in_top3 else 'n'}")
     print(f"  champion match: {match}/{total}; top-3 hit: {top3}/{total}; "
           f"mean regret {np.mean(regrets):.1f}% median {np.median(regrets):.1f}% "
           f"max {np.max(regrets):.1f}%; mean Spearman ρ={np.mean(rhos):.2f}")
+    print("  by n_req:  " + "  ".join(
+        f"n={nr}:{sum(o for o,_ in v)}/{len(v)},reg{np.mean([r for _,r in v]):.0f}%"
+        for nr, v in sorted(reg_by_n.items())))
 
     # Leave-one-model-out
     print("\n=== leave-one-model-out generalization ===")
@@ -189,13 +209,13 @@ def main():
             continue
         res_l = fit(train)
         errs_t, detail_t = eval_params(res_l.x, test, return_detail=True)
-        tps_errs = [abs(rel) for _, _, _, _, _, rel in detail_t]
+        tps_errs = [abs(rel) for _, _, _, _, _, rel, _ in detail_t]
         mape = 100 * np.mean(tps_errs) if tps_errs else float("nan")
         med = 100 * np.median(tps_errs) if tps_errs else float("nan")
-        # champion match + regret on held-out
+        # champion match + regret on held-out, per (workload, n_req)
         by_wl = {}
-        for mkey, label, wl, meas, pred, rel in detail_t:
-            by_wl.setdefault(wl, []).append((label, meas, pred))
+        for mkey, label, wl, meas, pred, rel, nr in detail_t:
+            by_wl.setdefault((wl, nr), []).append((label, meas, pred))
         cm = 0; regs = []
         for wl, lst in by_wl.items():
             mc, mc_tps, _ = max(lst, key=lambda t: t[1])
@@ -210,7 +230,8 @@ def main():
     out = {
         "fitted": {n: float(v) for n, v in zip(names, x)},
         "loss": float(res.fun),
-        "note": "global fit on 4-model calibration (robust clipped-MAE loss)",
+        "note": ("global fit on 4-model calibration + concurrency (n_req≤100), "
+                 "hierarchical AR; robust clipped-MAE loss over tps+itl+ttft"),
     }
     (HERE / "fitted_params.json").write_text(json.dumps(out, indent=2))
     print(f"\nwrote {HERE/'fitted_params.json'}")

@@ -35,7 +35,11 @@ from collections import defaultdict
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[1]      # repo-relative, not hardcoded
-RESULTS_GLOB = str(_REPO / "results" / "hetero_4x4_*_full_*")
+# Two dir shapes: the original full-grid sweeps (..._full_<ts>, one n_req per
+# cell, record.json = dict) and the concurrency sweeps (..._<ts>, multiple
+# n_req per cell, record.json = list of per-n_req entries). Both feed the fit;
+# n_req is part of the dedup key so the batch axis is preserved.
+RESULTS_GLOB = str(_REPO / "results" / "hetero_4x4_*")
 OUT_CSV = str(_REPO / "planner" / "calibration_data.csv")
 
 # 70b dirs whose PP cells were run with stock vLLM PP (no overlap fork).
@@ -52,11 +56,15 @@ MODEL_SPECS = {
                     head_dim=128, params_b=30,   vocab=50272),
     "qwen32b": dict(n_layers=64, hidden=5120, ffn_dim=25600, n_q=64, n_kv=8,
                     head_dim=128, params_b=32.8, vocab=151936),
+    "mistral123b": dict(n_layers=88, hidden=12288, ffn_dim=28672, n_q=96, n_kv=8,
+                    head_dim=128, params_b=123.0, vocab=32768),
 }
 SPEC_COLS = ["n_layers", "hidden", "ffn_dim", "n_q", "n_kv",
              "head_dim", "params_b", "vocab"]
 
 DIR_RE = re.compile(r"hetero_4x4_(?P<model>.+)_full_(?P<ts>\d{8}_\d{6})$")
+# Concurrency sweeps: no "_full_"; model token must not swallow the suffix.
+CONC_DIR_RE = re.compile(r"hetero_4x4_(?P<model>[^/]+?)_(?P<ts>\d{8}_\d{6})$")
 
 COLUMNS = [
     "model", "label", "tp", "pp", "layer_split", "ffn_splits",
@@ -84,9 +92,28 @@ def main() -> int:
     n_records = n_success = 0
     unknown_models = set()
 
+    # Additive accumulator: seed from the existing CSV so calibration rows whose
+    # source sweep dir was archived/removed during cleanup are NOT lost on a
+    # rebuild. Seeded rows carry the lowest possible ts, so any live re-scan of
+    # the same (model,label,workload,regime,n_req) cell overrides them. This
+    # makes the builder idempotent and never-lossy.
+    n_seeded = 0
+    if os.path.exists(OUT_CSV):
+        with open(OUT_CSV, newline="") as f:
+            for row in csv.DictReader(f):
+                key = (row["model"], row["label"], row["workload"],
+                       row["regime"], int(row["n_req"]))
+                # normalise to full COLUMNS (older CSVs may lack columns)
+                full = {c: row.get(c, "") for c in COLUMNS}
+                best[key] = ("00000000_000000", full)
+                n_seeded += 1
+    print(f"seeded from existing CSV: {n_seeded} rows")
+
     for d in sweep_dirs:
         base = os.path.basename(d)
-        m = DIR_RE.match(base)
+        m = DIR_RE.match(base)          # full-grid sweep (one n_req/cell)
+        if not m:
+            m = CONC_DIR_RE.match(base)  # concurrency sweep (multi n_req/cell)
         if not m:
             print(f"WARN: cannot parse dir name, skipping: {base}",
                   file=sys.stderr)
@@ -105,44 +132,52 @@ def main() -> int:
                 print(f"WARN: unreadable record {rec_path}: {e}",
                       file=sys.stderr)
                 continue
-            if not rec.get("success"):
-                continue
-            n_success += 1
+            # concurrency record.json is a list of per-n_req entries; the
+            # full-grid one is a single dict. Normalise to a list.
+            entries = rec if isinstance(rec, list) else [rec]
+            for rec in entries:
+                if not rec.get("success"):
+                    continue
+                n_success += 1
 
-            pp = int(rec["pp"])
-            regime = regime_for(model, pp, base)
-            spec = MODEL_SPECS.get(model, {})
-            row = {
-                "model": model,
-                "label": rec["label"],
-                "tp": rec["tp"],
-                "pp": pp,
-                "layer_split": "-".join(str(x) for x in rec["layer_split"]),
-                # per-TP-rank splits; first tp/2 ranks = Blackwell (B),
-                # last tp/2 ranks = Ada (A)
-                "ffn_splits": ":".join(str(x) for x in rec["ffn_splits"]),
-                "head_splits": ":".join(str(x) for x in rec["head_splits"]),
-                "kv_splits": ":".join(str(x) for x in rec["kv_splits"]),
-                "workload": rec["workload"],
-                "in_len": rec["in_len"],
-                "out_len": rec["out_len"],
-                "n_req": rec["n_req"],
-                "tps": rec["tps"],
-                "ttft_ms": rec["ttft_ms"],
-                "itl_ms": rec["itl_ms"],
-                "regime": regime,
-                "source_dir": base,
-            }
-            for c in SPEC_COLS:
-                row[c] = spec.get(c, "")
+                pp = int(rec["pp"])
+                regime = regime_for(model, pp, base)
+                spec = MODEL_SPECS.get(model, {})
+                row = {
+                    "model": model,
+                    "label": rec["label"],
+                    "tp": rec["tp"],
+                    "pp": pp,
+                    "layer_split": "-".join(str(x) for x in rec["layer_split"]),
+                    # per-TP-rank splits; first tp/2 ranks = Blackwell (B),
+                    # last tp/2 ranks = Ada (A)
+                    "ffn_splits": ":".join(str(x) for x in rec["ffn_splits"]),
+                    "head_splits": ":".join(str(x) for x in rec["head_splits"]),
+                    "kv_splits": ":".join(str(x) for x in rec["kv_splits"]),
+                    "workload": rec["workload"],
+                    "in_len": rec["in_len"],
+                    "out_len": rec["out_len"],
+                    "n_req": rec["n_req"],
+                    "tps": rec["tps"],
+                    "ttft_ms": rec["ttft_ms"],
+                    "itl_ms": rec["itl_ms"],
+                    "regime": regime,
+                    "source_dir": base,
+                }
+                for c in SPEC_COLS:
+                    row[c] = spec.get(c, "")
 
-            key = (model, rec["label"], rec["workload"], regime)
-            if key not in best or ts > best[key][0]:
-                best[key] = (ts, row)
+                # n_req in the key so the concurrency (batch) axis is preserved
+                # — otherwise the 5 n_req of a concurrency cell collapse to one.
+                key = (model, rec["label"], rec["workload"], regime,
+                       rec["n_req"])
+                if key not in best or ts > best[key][0]:
+                    best[key] = (ts, row)
 
     rows = sorted(
         (r for _, r in best.values()),
-        key=lambda r: (r["model"], r["regime"], r["label"], r["workload"]))
+        key=lambda r: (r["model"], r["regime"], r["label"], r["workload"],
+                       int(r["n_req"])))
 
     os.makedirs(os.path.dirname(OUT_CSV), exist_ok=True)
     with open(OUT_CSV, "w", newline="") as f:
@@ -173,13 +208,13 @@ def main() -> int:
     champs = {}
     for r in rows:
         k = (r["model"], r["workload"])
-        if k not in champs or r["tps"] > champs[k]["tps"]:
+        if k not in champs or float(r["tps"]) > float(champs[k]["tps"]):
             champs[k] = r
     print("\nchampion (max tps) per model x workload:")
     for (mdl, wl) in sorted(champs):
         r = champs[(mdl, wl)]
         print(f"  {mdl:8s} {wl:14s} -> {r['label']:45s} "
-              f"[{r['regime']:7s}] tps={r['tps']:.1f}")
+              f"[{r['regime']:7s}] tps={float(r['tps']):.1f}")
     return 0
 
 

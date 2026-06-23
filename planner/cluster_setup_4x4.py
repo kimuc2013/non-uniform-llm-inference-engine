@@ -118,7 +118,7 @@ def _restart_head() -> None:
     env = os.environ.copy()
     env["VLLM_HOST_IP"] = HEAD_IP
     env["NCCL_SOCKET_IFNAME"] = HEAD_IB
-    env["NCCL_IB_HCA"] = "mlx5"
+    env["NCCL_IB_HCA"] = CFG.nccl_ib_hca
     p = subprocess.run(
         [head_ray, "start", "--head", "--node-ip-address", HEAD_IP, "--port", RAY_PORT],
         env=env, capture_output=True, text=True, timeout=60,

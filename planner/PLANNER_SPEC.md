@@ -132,20 +132,35 @@ n_AR  = 2 · L_s                                   # attn-out + ffn-down per lay
 msg   = B · S · h · b_a                           # S=1 decode, S=T_c prefill
 ```
 
-**AllReduce — ring clocked by the slowest link** (the hetero-cluster key fact):
+**AllReduce — hierarchical (2-tier) collective, NOT a flat cross-node ring**
+(the hetero-cluster key fact, corrected 2026-06-23):
+
+A TP group that spans `n_nodes` nodes with `n_local` GPUs each does **not** pay a
+flat `2(Nt−1)` serial IB-latency ring. NCCL runs an intra-node reduce-scatter +
+all-gather over NVLink and only an inter-node ring over IB, so:
 
 ```
-t_AR(msg) = 2·(Nt−1)/Nt · msg / min_link_bw(group)  +  2·(Nt−1) · α_AR(group)
+single node (n_nodes=1):
+  t_AR = 2(N−1)/N · msg / bw_intra              +  2(N−1)        · α_intra
+cross node (n_nodes>1):
+  t_AR = 2(n_local−1)/n_local · msg / bw_intra  (NVLink RS+AG)
+       + 2(n_nodes−1)/n_nodes · msg / bw_cross  (IB inter-node ring, NIC shared
+                                                 by the n_local local GPUs)
+       + 2(n_nodes−1) · α_cross  +  2(n_local−1) · α_intra
 ```
 
-where `min_link_bw` = `bw_cross` whenever the TP group spans nodes, else
-`bw_intra`; `α_AR` likewise. Two regimes fall out:
+The **latency** term is the decisive correction: a 4+4 TP8 group pays
+`2(n_nodes−1)=2` IB hop-latencies, **not** `2(Nt−1)=14`. The old flat-ring form
+over-charged cross-node decode AR ~6× (e.g. 45 ms/token for 8B TP8 vs ~8 ms
+measured), which made the planner pick PP over TP8 at *every* load and miss the
+measured low-concurrency TP8 champion. Two regimes still fall out:
 
-- decode (`msg ≈ B·h·b_a ≈ 1–2 MB`): **latency-floor** dominated,
-  `t_AR ≈ 2(Nt−1)·α_cross ≈ 1 ms/AR` cross-node on the current cluster
-  → `2·L` ms per decode step — this is what kills cross-node TP8 for small models.
-- prefill (`msg ≈ T_c·h·b_a ≈ 100+ MB`): **bandwidth** dominated, amortized per
-  token: `ar_bytes/token = 2·L · 2(Nt−1)/Nt · h·b_a`.
+- decode (`msg ≈ B·h·b_a`): **latency-floor** dominated by the *inter-node* hops
+  only → cross-node TP8 is viable at low load (few microseconds × 2L), and only
+  loses to TP4-PP2 once the per-token AR *bandwidth* term grows with batch.
+  This batch-dependent crossover is now reproduced (validated §8).
+- prefill (`msg ≈ T_c·h·b_a`): **bandwidth** dominated; the inter-node IB ring is
+  the bottleneck link, `ar_bytes/token = 2·L · 2(n_nodes−1)/n_nodes · h·b_a`.
 
 ### 3.3 Optimal split — closed forms
 
@@ -301,6 +316,82 @@ TPS_wall  = n_req · out_len / T_total
 Refinement (second order, optional): decode KV grows linearly over the phase;
 using `kv̄ = in_len + out_len/2` in `KV_read_r` integrates this exactly for the
 linear KV term.
+
+**Calibration corrections applied (2026-06-23) — batch axis + hierarchical AR:**
+- *Hierarchical AllReduce* (§3.2): replaced the flat cross-node ring latency
+  `2(Nt−1)·α_cross` with the 2-tier NVLink+IB form. This was the single largest
+  correction — it lifted cross-node TP8 from ~2.6× under-predicted to within
+  ~12% and unblocked the load-dependent TP8↔TP4PP2 champion crossover.
+- *Concurrency (batch) axis folded into calibration.* The fit now spans
+  `n_req ∈ {8,16,32,64,96}` (3 model sizes), not just the single high-load point
+  per model. `build_calibration.py` is an additive accumulator (seeds from the
+  existing CSV so archived sweeps are not lost) and tags `n_req` in the dedup key.
+- *n_req ≤ 100 operating rule enforced in the fit/validation.* Old `n=128` sweeps
+  sit in a KV-preemption thrashing regime (Ada small-partition rank OOMs) the
+  cost model deliberately does not represent; they were the dominant MAPE source
+  (129% at n=128 vs 12–17% at n≤96) and are excluded.
+- *Logic fixes from the adversarial consistency audit (2026-06-23).* An 8-component
+  audit (each finding independently refuted-or-confirmed) caught five real
+  derivation bugs, now fixed: (1) **embedding double-count** — `params_on_rank`
+  added the full `p_embed` (=2·V·h untied) on BOTH PP end stages; physically
+  stage 0 holds only the input table (V·h) and the last stage only lm_head (V·h),
+  so `embed_on_stage()` now charges one V·h per end stage (pp>1) — removes an
+  anti-PP bias that hit the bottleneck Ada stage. (2) **partial last prefill
+  chunk** was charged a full `T_CHUNK` → a sawtooth in T_prefill; now the last
+  chunk takes its true remainder and `c_chunk` is per-chunk not per-stage.
+  (3) **dropped-remainder decode** — `mb=n_req//pp` modeled `pp·⌊n_req/pp⌋`
+  requests while the TPS numerator used `n_req`; now `n_mb=min(pp,n_req)`,
+  `mb=n_req/n_mb` (exact, affine-conserving). (4) **0-layer PP stage** from the
+  fix-sum loop → `optimal_layer_split` now does a constrained water-fill (pin to
+  ≥1, re-solve the active set). (5) **power-of-2-only PP enumeration** — `plan()`
+  now enumerates every divisor of `world` so 3+3 (pp∈{3,6}) is covered. Plus the
+  Case-B FFN water-fill now includes the KV-read floor, and decode P2P is charged
+  over pp−1 (not pp) links.
+- *Per-node intra-AR (NVLink vs PCIe), 2026-06-23.* The Blackwell head has NVLink
+  but the Ada worker is PCIe; a single `intra_ar` over-charged the Blackwell
+  stage's AllReduce and under-skewed PP layer allocation (the 8B-skew residual).
+  `HardwareSpec.intra_params(gpu)` now returns NVLink (≈800 GB/s, 4 µs, a fixed
+  physics constant — NOT fitted, to avoid overfitting) for Blackwell and PCIe for
+  Ada. This fixed the 4+4 8B layer-skew exactly and lifted **champion 19→25/34,
+  mean regret 3.5→2.1%, Spearman 0.72→0.83** after re-fit. (The PP layer-split
+  search neighborhood was widened ±2→±3 to track the shifted optimum.)
+- *Result (final fit):* champion 25/34, **mean regret 2.1%, median 0.0%**, top-3
+  32/34, Spearman ρ≈0.83; TPS-MAPE 70B 11.5% / 8B 13.1% / 123B 17.4% / opt30b
+  43%. LOMO held-out 70B 9/10 (regret 0.7%), 8B 7/10. **Layout generalization
+  (zero-refit, 4+4 fit params, cost model is layout-parametric): 4+4 champion
+  27/30 regret 0.2% · 2+2 regret 7.5% · 1+1 regret 3.4%** — a planner calibrated
+  on 4+4 transfers to 1+1/2+2 with bounded regret, covering the 1+1→4+4 target.
+  Fitted engine params drift to `step_floor→0, c_mb≈0.07, overlap_eta→1.0,
+  prefill_overlap→0`: with CUDA graphs per-step dispatch is hidden and the
+  well-overlapped fork pipeline is max-stage-bound.
+- *Self-consistency suite* `planner/check_consistency.py` (17 invariants, all
+  pass): finite/positive outputs; TPS & decode-cycle monotone in n_req (incl.
+  non-divisible n); TP8 throughput saturates; **homogeneous-cluster collapse**
+  (non-uniform → uniform when there is no heterogeneity); closed-form TP/layer
+  splits == brute-force optimum; AR sanity (cross≥intra, monotone, branch
+  continuity); feasibility monotone; bias favors the fast node; champion topology
+  monotone in load; layouts 1+1/2+2/3+3/4+4 sane; + regression guards for the
+  five audited bugs (embed charge, no-0-layer, no prefill sawtooth, full
+  factorization, remainder conservation). A failure here is a logic bug, not a
+  calibration gap — this is the "logically convincing" leg of the planner.
+- *Residual gaps (current):* (a) **opt30b TP8** (74% MAPE) — its no-GQA
+  (n_kv=n_q=56) + tied-embed arch makes the TP8 KV term mis-scale; TP8 is not
+  opt30b's champion at n≤100 so regret impact is bounded. (b) **8B layer-skew at
+  mid-load** — FIXED by the per-node intra-AR (NVLink vs PCIe) above; TP4PP2_skew+8
+  now matches at every n at 4+4. (c2) **low-n FFN-bias degree** — at every layout
+  the planner picks ffn_bias+50 where measured prefers +25 (regret 3.7–8.7%, a
+  flat-curve near-tie at low load where the bias barely matters); membw-driven,
+  not addressed by the AR fix. (c3) **2+2 crossover point** — the NVLink fix
+  nudged the planner to cross from TP4PP1 to TP2PP2 one step early at 2+2 n=32
+  (18.5% on that one zero-refit cell). (c) opt30b prefill_heavy n=64 (28% regret).
+- *Deliberate approximations (audit-flagged, NOT bugs, left as-is):* the
+  quadratic attention prefill term `2·head_r·d_h·Σsᵢ²` is dropped (small at our
+  seqlens); the PP bubble `(1−η)·b_rest` and exposed P2P are moot under the
+  fitted η→1; `decode_weight_of` uses a fixed in/12 token-speed ratio (a routing
+  heuristic, not a timing term); non-uniform FFN/head bias is generated only for
+  pp=1 — correct for symmetric n+n layouts where every PP stage is intra-node and
+  homogeneous, but it would miss within-stage heterogeneity in an asymmetric
+  placement. These are documented so "tested == the path the planner runs."
 
 **Calibration corrections applied (2026-06-13) and residual gaps:**
 - *Prefill TFLOPS doubled* (Blackwell 289→578, Ada 183→366): the originals were

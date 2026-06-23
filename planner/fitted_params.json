@@ -1,14 +1,14 @@
 {
   "fitted": {
-    "ar_latency_us": 50.0,
-    "ar_bw_gbs": 30.0,
-    "intra_ar_latency_us": 13.63924806042479,
-    "step_floor_ms": 14.181720854501243,
-    "c_mb_ms": 3.087863211493601,
-    "c_chunk_ms": 15.788886011570177,
+    "ar_latency_us": 5.0,
+    "ar_bw_gbs": 4.525177195176153,
+    "intra_ar_latency_us": 7.119944305315508,
+    "step_floor_ms": 1.7547988754977373,
+    "c_mb_ms": 0.6775713593040039,
+    "c_chunk_ms": 0.0,
     "overlap_eta": 1.0,
-    "prefill_overlap": 0.1577257920545411
+    "prefill_overlap": 0.0
   },
-  "loss": 0.3761214196532446,
-  "note": "global fit on 4-model calibration (robust clipped-MAE loss)"
+  "loss": 0.33907566145948365,
+  "note": "global fit on 4-model calibration + concurrency (n_req\u2264100), hierarchical AR; robust clipped-MAE loss over tps+itl+ttft"
 }

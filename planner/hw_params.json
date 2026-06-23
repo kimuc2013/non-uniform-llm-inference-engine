@@ -16,11 +16,6 @@
     "p2p_latency_us": 200,
     "p2p_bw_gbs": 10.0
   },
-  "overlap": {
-    "pp2_gain_bal": 1.036,
-    "pp2_gain_dec": 1.044,
-    "pp2_gain_pre": 1.094
-  },
   "notes": [
     "All values are EFFECTIVE (fitted to measured sweep records under results/hetero_4x4_*_full_*), not vendor spec. Anchor model = Llama-70B cells (most saturated); 8B/OPT30B add a per-step overhead floor; qwen32b TP8/PP cells are pathological outliers and were excluded.",
     "DECODE BW (per GPU): from 70B TP1PP8 decode_heavy n=128 assuming pp=8 weight passes/round. Ada: uniform 10x8 (tps 632.8, round 202.3ms) -> 8x17.64GB weights + 4.03GB KV = 143.1GB / 202.3ms = 707 GB/s (74% of 960 spec). Blackwell: blackbias 14:6 (tps 840.4, round 152.3ms) -> 200.4GB/152.3ms = 1316 GB/s busy-bound lower bound; sweet-ratio 2.33 x 707 = 1648 upper; adopted 1400 (78% of 1800 spec). OPT30B 8:4 cross-check: Blackwell >= 1264, Ada >= 632.",

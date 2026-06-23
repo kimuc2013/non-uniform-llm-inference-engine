@@ -35,7 +35,8 @@ HEAD_IB = CFG.head_fabric_ip
 RAY_ADDR = CFG.ray_address
 
 # per-model default concurrency (matches the original per-model sweeps)
-DEFAULT_NREQ = {"8b": 128, "70b": 128, "qwen32b": 128, "opt30b": 64, "mistral123b": 96}
+DEFAULT_NREQ = {"8b": 96, "70b": 96, "qwen32b": 96, "opt30b": 64, "mistral123b": 96}
+# all ≤ 100: above it the Ada small-partition rank OOMs into KV thrashing (hard rule)
 WORKLOAD_SHAPE = {"balanced": (512, 256), "decode_heavy": (128, 512), "prefill_heavy": (1024, 128)}
 
 
@@ -331,7 +332,13 @@ def main():
     ap.add_argument("--n-req-list", default="", help="concurrency sweep: comma-sep n_reqs run "
                     "against ONE loaded server per config (no reload). e.g. 8,16,32,64,96")
     ap.add_argument("--dry-run", action="store_true", help="print config grid, no launch")
+    ap.add_argument("--extra-workload", default="", help="register a held-out "
+                    "workload as NAME:IN:OUT (then pass --workloads NAME)")
     args = ap.parse_args()
+
+    if args.extra_workload:                       # held-out workload: NAME:IN:OUT
+        nm, il, ol = args.extra_workload.split(":")
+        WORKLOAD_SHAPE[nm] = (int(il), int(ol))
 
     model = PP.MODELS[args.model].name
     n_req = args.n_req or DEFAULT_NREQ.get(args.model, 96)

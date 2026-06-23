@@ -1,6 +1,8 @@
 """Universal hetero TP/PP serving planner.
 
-Implements PLANNER_SPEC.md v1: closed-form throughput prediction + optimal
+Implements PLANNER_SPEC.md (incl. the 2026-06-23 corrections: hierarchical AR,
+per-node NVLink/PCIe intra-AR, embed_on_stage, n_mb=min(pp,n_req), affine layer-
+split water-fill, max+(1-ρ)min wall blend): closed-form throughput prediction + optimal
 split derivation + config search for arbitrary (model, hardware, workload)
 on heterogeneous clusters.
 
@@ -21,7 +23,7 @@ import csv
 import json
 import math
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -97,10 +99,16 @@ class HardwareSpec:
     nodes: tuple                    # tuple[(GpuType, count), ...] in rank order
     ar_latency_us: float            # cross-node per-hop AR latency
     ar_bw_gbs: float                # cross-node AR algorithm bandwidth
-    intra_ar_latency_us: float      # intra-node per-hop latency
+    intra_ar_latency_us: float      # intra-node per-hop latency (PCIe / no-NVLink)
     intra_ar_bw_gbs: float
     p2p_latency_us: float
     p2p_bw_gbs: float
+    # NVLink-equipped GPUs (the Blackwell head) get a much faster intra-node AR
+    # than PCIe GPUs (the Ada worker has no NVLink). Modeling both with one PCIe-
+    # like intra param over-charges the Blackwell stage's AR and under-skews PP
+    # layer allocation. Physics-anchored constants (NOT fitted).
+    nvlink_ar_latency_us: float = 4.0
+    nvlink_ar_bw_gbs: float = 800.0
     overlap_eta: float = 0.65       # fork PP overlap efficiency
     step_floor_ms: float = 30.0     # per-decode-step CPU/dispatch floor (all topologies)
     c_mb_ms: float = 1.5            # per-microbatch CPU dispatch
@@ -139,6 +147,13 @@ class HardwareSpec:
                 return i
             acc += c
         raise IndexError(rank)
+
+    def intra_params(self, gpu_name: str):
+        """(latency_us, bw_gbs) for an intra-node AR on this GPU type: NVLink for
+        Blackwell, PCIe for everything else (the Ada worker)."""
+        if "blackwell" in gpu_name.lower():
+            return self.nvlink_ar_latency_us, self.nvlink_ar_bw_gbs
+        return self.intra_ar_latency_us, self.intra_ar_bw_gbs
 
 
 def load_hardware(path: Path = HW_PARAMS) -> HardwareSpec:
@@ -208,24 +223,67 @@ B_W = 2          # bytes per weight (bf16)
 B_KV = 2
 B_A = 2
 T_CHUNK = 8192   # max_num_batched_tokens-ish prefill chunk
+C_ACT = 6        # peak activation multiplier in mem_feasible (PLANNER_SPEC §6, c_act≈4–8)
+
+
+def embed_on_stage(m: ModelSpec, pp: int, stage: int) -> float:
+    """Embedding params physically resident on a PP stage (pre-TP-division).
+
+    pp==1: the single stage holds BOTH the input table and lm_head → p_embed
+    (= V·h for tied, 2·V·h for untied). pp>1: the input embedding table (V·h)
+    lives on stage 0 and the lm_head (V·h) on the last stage — two *separate*
+    V·h tensors regardless of tying (PP can't share a weight across stages, so
+    a tied model replicates). Charging the full p_embed on each end stage (the
+    old `with_embed` path) double-counted untied embeddings → an anti-PP bias.
+    """
+    if pp == 1:
+        return m.p_embed
+    if stage == 0 or stage == pp - 1:
+        return float(m.vocab * m.hidden)        # one V·h table per end stage
+    return 0.0
 
 
 def params_on_rank(m: ModelSpec, layers: int, head_r: int, ffn_r: int,
-                   tp: int, with_embed: bool) -> float:
+                   tp: int, embed_params: float) -> float:
     p = layers * (m.p_attn * head_r / m.n_q + m.p_ffn * ffn_r / m.ffn_dim)
-    if with_embed:
-        p += m.p_embed / tp
+    p += embed_params / tp
     return p
 
 
-def t_allreduce_ms(msg_bytes: float, n_ranks: int, cross_node: bool,
-                   hw: HardwareSpec) -> float:
-    if n_ranks <= 1:
+def t_allreduce_ms(msg_bytes: float, ranks: list, hw: HardwareSpec) -> float:
+    """Hierarchical (2-tier) all-reduce cost over the actual rank placement.
+
+    A cross-node TP group does NOT pay 2(N-1) serial IB-latency hops: NCCL runs
+    intra-node reduce-scatter + all-gather over NVLink and only an inter-node
+    ring over IB. So latency = 2(n_nodes-1)·α_ib + 2(n_local-1)·α_nv, i.e. for a
+    4+4 TP8 group just ONE IB hop-pair, not seven. Single-node groups reduce to
+    the plain intra-node ring (unchanged behaviour). This is the term that was
+    over-charging high-radix cross-node decode AR ~6× and blocking the
+    low-concurrency TP8 champion crossover.
+    """
+    n = len(ranks)
+    if n <= 1:
         return 0.0
-    lat_us = hw.ar_latency_us if cross_node else hw.intra_ar_latency_us
-    bw_gbs = hw.ar_bw_gbs if cross_node else hw.intra_ar_bw_gbs
-    vol = 2 * (n_ranks - 1) / n_ranks * msg_bytes
-    return vol / (bw_gbs * 1e9) * 1e3 + 2 * (n_ranks - 1) * lat_us / 1e3
+    counts = {}
+    for r in ranks:
+        nd = hw.node_of_rank(r)
+        counts[nd] = counts.get(nd, 0) + 1
+    n_nodes = len(counts)
+    n_local = max(counts.values())            # ranks per node (balanced groups)
+    if n_nodes == 1:
+        # intra-node AR uses this node's interconnect (Blackwell=NVLink fast,
+        # Ada=PCIe slow) — not a single shared param.
+        lat, bw = hw.intra_params(hw.gpu_of_rank(ranks[0]).name)
+        vol = 2 * (n - 1) / n * msg_bytes
+        return vol / (bw * 1e9) * 1e3 + 2 * (n - 1) * lat / 1e3
+    # 2-tier: NVLink reduce-scatter+all-gather, then an inter-node ring over IB.
+    # The per-node IB NIC is shared by the n_local local GPUs, so the aggregate
+    # inter-node volume on the bottleneck NIC is 2(n_nodes-1)/n_nodes·msg (the
+    # /n_local of per-GPU traffic cancels against n_local GPUs sharing the NIC).
+    t_intra = (2 * (n_local - 1) / n_local * msg_bytes) / (hw.intra_ar_bw_gbs * 1e9) * 1e3
+    t_inter = (2 * (n_nodes - 1) / n_nodes * msg_bytes) / (hw.ar_bw_gbs * 1e9) * 1e3
+    lat = 2 * (n_nodes - 1) * hw.ar_latency_us + 2 * (n_local - 1) * hw.intra_ar_latency_us
+    return t_intra + t_inter + lat / 1e3
 
 
 def stage_ranks(cfg: Config, hw: HardwareSpec, stage: int) -> list:
@@ -243,13 +301,12 @@ def stage_time_decode_ms(m: ModelSpec, hw: HardwareSpec, w: Workload,
                          cfg: Config, stage: int, batch: int) -> float:
     layers = cfg.layer_split[stage]
     rs = stage_ranks(cfg, hw, stage)
-    cross = stage_is_cross_node(cfg, hw, stage)
-    with_embed = stage == 0 or stage == cfg.pp - 1
+    embed = embed_on_stage(m, cfg.pp, stage)
     t_max = 0.0
     for i, r in enumerate(rs):
         g = hw.gpu_of_rank(r)
         pr = params_on_rank(m, layers, cfg.head_splits[i], cfg.ffn_splits[i],
-                            cfg.tp, with_embed)
+                            cfg.tp, embed)
         w_bytes = pr * B_W
         kv_read = batch * w.kv_avg * layers * 2 * cfg.kv_splits[i] * m.head_dim * B_KV
         t_mem = (w_bytes / (g.membw_gbs * 1e9)
@@ -257,7 +314,7 @@ def stage_time_decode_ms(m: ModelSpec, hw: HardwareSpec, w: Workload,
         t_flop = (2 * pr * batch) / (g.tflops_prefill * 1e12) * 1e3
         t_max = max(t_max, max(t_mem, t_flop))
     msg = batch * m.hidden * B_A
-    t_ar = 2 * layers * t_allreduce_ms(msg, cfg.tp, cross, hw)
+    t_ar = 2 * layers * t_allreduce_ms(msg, rs, hw)
     return t_max + t_ar
 
 
@@ -265,20 +322,19 @@ def stage_time_prefill_ms(m: ModelSpec, hw: HardwareSpec, w: Workload,
                           cfg: Config, stage: int, chunk_tokens: int) -> float:
     layers = cfg.layer_split[stage]
     rs = stage_ranks(cfg, hw, stage)
-    cross = stage_is_cross_node(cfg, hw, stage)
-    with_embed = stage == 0 or stage == cfg.pp - 1
+    embed = embed_on_stage(m, cfg.pp, stage)
     t_max = 0.0
     for i, r in enumerate(rs):
         g = hw.gpu_of_rank(r)
         pr = params_on_rank(m, layers, cfg.head_splits[i], cfg.ffn_splits[i],
-                            cfg.tp, with_embed)
+                            cfg.tp, embed)
         t_flop = (2 * pr * chunk_tokens) / (g.tflops_prefill * hw.prefill_tf_mult * 1e12) * 1e3
         t_mem = (pr * B_W) / (g.membw_gbs * 1e9) * 1e3
         t_max = max(t_max, max(t_flop, t_mem))
     msg = chunk_tokens * m.hidden * B_A
     # In prefill the TP AllReduce of large (chunk-sized) messages overlaps the
     # GEMMs under async-TP / sequence-parallel; charge only the exposed fraction.
-    t_ar = 2 * layers * t_allreduce_ms(msg, cfg.tp, cross, hw)
+    t_ar = 2 * layers * t_allreduce_ms(msg, rs, hw)
     return t_max + (1 - hw.prefill_ar_overlap) * t_ar
 
 
@@ -306,27 +362,43 @@ def predict(m: ModelSpec, hw: HardwareSpec, w: Workload, cfg: Config,
         t_step = stage_time_decode_ms(m, hw, w, cfg, 0, w.n_req)
         t_cycle = t_step + hw.step_floor_ms
     else:
-        n_mb = pp                              # bq = pp microbatches
-        mb = max(1, w.n_req // n_mb)
+        # bq = pp microbatches, but never more than there are requests (else we
+        # fabricate phantom microbatches). mb is the *exact* average so the
+        # served count n_mb·mb == n_req (no dropped remainder): stage_time is
+        # affine in batch, so n_mb·t_s(n_req/n_mb) charges n_mb weight-streams
+        # and exactly n_req of linear KV/flop work.
+        n_mb = min(pp, w.n_req)
+        mb = w.n_req / n_mb
         busy = [n_mb * (stage_time_decode_ms(m, hw, w, cfg, s, mb) + hw.c_mb_ms)
                 for s in range(pp)]
         b_max = max(busy)
         b_rest = sum(busy) - b_max
+        # exactly pp-1 inter-stage P2P boundaries (last stage has no successor)
         t_send = (mb * m.hidden * B_A) / (hw.p2p_bw_gbs * 1e9) * 1e3 \
                  + hw.p2p_latency_us / 1e3
-        t_cycle = b_max + (1 - eta) * b_rest + (1 - eta) * t_send * pp \
+        t_cycle = b_max + (1 - eta) * b_rest + (1 - eta) * t_send * (pp - 1) \
                   + hw.step_floor_ms
     t_decode_s = w.out_len * t_cycle / 1e3
 
     # ---- prefill phase ----
+    # Chunk the input; the LAST chunk takes the remainder (not a full T_CHUNK —
+    # charging full T_CHUNK over-counts tokens and makes T_prefill jump at every
+    # chunk boundary). c_chunk is a per-chunk CPU floor → charged once per chunk,
+    # not per PP stage. Pipeline = fill (first chunk through all stages) +
+    # steady (each later chunk costs the bottleneck stage + exposed bubble).
     total_in = w.n_req * w.in_len
     n_chunks = max(1, math.ceil(total_in / T_CHUNK))
-    chunk = min(total_in, T_CHUNK)
-    ts_pre = [stage_time_prefill_ms(m, hw, w, cfg, s, chunk) + hw.c_chunk_ms
-              for s in range(pp)]
-    t_max_pre = max(ts_pre)
-    fill = sum(ts_pre)
-    t_prefill_ms = fill + (n_chunks - 1) * (t_max_pre + (1 - eta) * (sum(ts_pre) - t_max_pre))
+    t_prefill_ms = 0.0
+    fill = 0.0
+    for j in range(n_chunks):
+        ck = T_CHUNK if j < n_chunks - 1 else total_in - (n_chunks - 1) * T_CHUNK
+        ts = [stage_time_prefill_ms(m, hw, w, cfg, s, ck) for s in range(pp)]
+        t_max_c = max(ts)
+        if j == 0:
+            fill = sum(ts) + hw.c_chunk_ms                            # first chunk → all stages
+            t_prefill_ms += fill
+        else:
+            t_prefill_ms += t_max_c + (1 - eta) * (sum(ts) - t_max_c) + hw.c_chunk_ms
     t_prefill_s = t_prefill_ms / 1e3
 
     # Prefill (compute/tensor-core bound) and decode (HBM-bound) run on
@@ -356,14 +428,14 @@ def mem_feasible(m: ModelSpec, hw: HardwareSpec, w: Workload, cfg: Config):
     for s in range(cfg.pp):
         layers = cfg.layer_split[s]
         rs = stage_ranks(cfg, hw, s)
-        with_embed = s == 0 or s == cfg.pp - 1
+        embed = embed_on_stage(m, cfg.pp, s)
         for i, r in enumerate(rs):
             g = hw.gpu_of_rank(r)
             weights = params_on_rank(m, layers, cfg.head_splits[i],
-                                     cfg.ffn_splits[i], cfg.tp, with_embed) * B_W
+                                     cfg.ffn_splits[i], cfg.tp, embed) * B_W
             kv = w.n_req * (w.in_len + w.out_len) * layers * 2 \
                  * cfg.kv_splits[i] * m.head_dim * B_KV
-            act = 6 * T_CHUNK * max(m.hidden, 2 * cfg.ffn_splits[i]) * B_A
+            act = C_ACT * T_CHUNK * max(m.hidden, 2 * cfg.ffn_splits[i]) * B_A
             overhead = (1.5 + 2.0) * 1e9      # CUDA ctx/NCCL + graph pool
             need = weights + kv + act + overhead
             cap = g.mem_gb * 1e9 * hw.mem_util
@@ -424,7 +496,13 @@ def optimal_tp_splits(m: ModelSpec, hw: HardwareSpec, w: Workload, tp: int,
         g = hw.gpu_of_rank(r)
         bw = g.membw_gbs * 1e9
         tf = g.tflops_prefill * 1e12
-        a_dec = (m.p_attn / tp * B_W) / bw
+        # attention floor a_r = attn weight stream + KV read (per layer, per
+        # rank). The KV term (spec §3.3 Case B) is independent of the FFN width
+        # being solved for, so it belongs in the fixed cost a_r; omitting it
+        # under-weights the attention floor on KV-heavy (no-GQA) models.
+        kv_read = (w.n_req * w.kv_avg * 2 * max(1, m.n_kv // tp)
+                   * m.head_dim * B_KV) / (bw * hw.kv_bw_scale)
+        a_dec = (m.p_attn / tp * B_W) / bw + kv_read
         c_dec = (m.ffn_mats * m.hidden * B_W) / bw
         a_pre = (2 * m.p_attn / tp) / tf
         c_pre = (2 * m.ffn_mats * m.hidden) / tf
@@ -442,28 +520,68 @@ def optimal_tp_splits(m: ModelSpec, hw: HardwareSpec, w: Workload, tp: int,
 
 def optimal_layer_split(m: ModelSpec, hw: HardwareSpec, w: Workload, tp: int,
                         pp: int, decode_weight: float):
-    """Closed-form L_s ∝ stage speed (water-filling, integer rounding)."""
-    taus = []
+    """Closed-form layer split by water-filling on the *marginal per-layer stage
+    cost*, computed by finite difference of the cost model itself so it stays
+    consistent with predict().
+
+    Balancing stage busy times needs L_s ∝ 1/c_s where c_s is the per-layer
+    cost on stage s. c_s is NOT just 1/membw_s: each layer also pays an
+    AllReduce that is (largely) GPU-independent, so c_s = a/speed_s + b with
+    b>0. Using the raw membw ratio (b ignored) over-skews toward the fast node
+    — the bug invariant #7 caught. The finite difference d(stage_time)/dL
+    captures a/speed_s + b exactly (weight stream + KV + per-layer AR)."""
+    ffn_u = [m.ffn_dim // tp] * tp
+    head_u = [m.n_q // tp] * tp
+    kv_u = [max(1, m.n_kv // tp)] * tp
+    B = max(1, w.n_req // pp)
+    chunk = min(max(1, w.n_req) * w.in_len, T_CHUNK)
+    # Affine model of each stage: stage_time_s(L) = c_s·L + f_s, fit by two
+    # cost-model evaluations (L=1,2). c_s = per-layer slope (weight stream + KV +
+    # per-layer AR); f_s = L-independent intercept (input/output embedding,
+    # lm_head GEMM, AR base). The last stage's lm_head makes f_s large there, so
+    # it should hold FEWER layers — ignoring f_s under-skews (invariant #7).
+    c, f = [], []
     for s in range(pp):
-        rs = list(range(s * tp, (s + 1) * tp))
-        # min over ranks of stage speed = bottleneck GPU
-        gs = [hw.gpu_of_rank(r) for r in rs]
-        bw = min(g.membw_gbs for g in gs)
-        tf = min(g.tflops_prefill for g in gs)
-        tau_dec = 1 / bw
-        tau_pre = 1 / tf
-        tau = decode_weight * tau_dec * 1e3 + (1 - decode_weight) * tau_pre
-        taus.append(tau)
-    inv = [1 / t for t in taus]
-    tot = sum(inv)
-    raw = [m.n_layers * x / tot for x in inv]
-    ls = [max(1, round(x)) for x in raw]
-    # fix sum
+        c2 = Config(tp, pp, [2] * pp, ffn_u, head_u, kv_u)
+        c1 = Config(tp, pp, [1] * pp, ffn_u, head_u, kv_u)
+        t1 = (decode_weight * stage_time_decode_ms(m, hw, w, c1, s, B)
+              + (1 - decode_weight) * stage_time_prefill_ms(m, hw, w, c1, s, chunk))
+        t2 = (decode_weight * stage_time_decode_ms(m, hw, w, c2, s, B)
+              + (1 - decode_weight) * stage_time_prefill_ms(m, hw, w, c2, s, chunk))
+        c_s = max(t2 - t1, 1e-9)
+        c.append(c_s)
+        f.append(t1 - c_s)                      # intercept = stage_time(L=0)
+    # Constrained water-fill: equalize c_s·L_s + f_s = T* s.t. ΣL_s = n_layers
+    # and L_s ≥ 1. When a stage would fall below 1 it is pinned to 1 and the
+    # remaining layers are RE-SOLVED over the active set (a plain max(1,·) +
+    # multiplicative rescale unbalances the survivors and the fix-sum decrement
+    # could drive a stage to 0 — the bug invariant caught). pp ≤ n_layers is
+    # guaranteed by the caller, so a feasible ≥1 allocation always exists.
+    inv = [1.0 / x for x in c]
+    L = [0.0] * pp
+    active = list(range(pp))
+    remaining = float(m.n_layers)
+    while active:
+        denom = sum(inv[s] for s in active)
+        T_star = (remaining + sum(f[s] * inv[s] for s in active)) / denom
+        vals = {s: (T_star - f[s]) * inv[s] for s in active}
+        below = [s for s in active if vals[s] < 1.0]
+        if not below:
+            for s in active:
+                L[s] = vals[s]
+            break
+        for s in below:
+            L[s] = 1.0
+            remaining -= 1.0
+            active.remove(s)
+    # integer rounding that preserves the sum and never drops a stage below 1
+    ls = [max(1, int(round(x))) for x in L]
     while sum(ls) > m.n_layers:
-        i = max(range(pp), key=lambda j: ls[j] - raw[j])
+        cand = [j for j in range(pp) if ls[j] > 1]
+        i = max(cand, key=lambda j: ls[j] - L[j])
         ls[i] -= 1
     while sum(ls) < m.n_layers:
-        i = min(range(pp), key=lambda j: ls[j] - raw[j])
+        i = min(range(pp), key=lambda j: ls[j] - L[j])
         ls[i] += 1
     return ls
 
@@ -500,9 +618,9 @@ def plan(m: ModelSpec, hw: HardwareSpec, w: Workload, top_k: int = 10,
         cands.append(cfg_b)
 
     # ---- TP×PP factorizations ----
-    for pp in [2, 4, 8]:
-        if world % pp != 0 or pp == 1:
-            continue
+    # Enumerate EVERY divisor of world (not just powers of two) so odd layouts
+    # in the 1+1..4+4 target are covered — e.g. world=6 (3+3) needs pp∈{2,3,6}.
+    for pp in [d for d in range(2, world + 1) if world % d == 0]:
         tp_s = world // pp
         if m.n_q % tp_s != 0:
             continue
@@ -520,7 +638,7 @@ def plan(m: ModelSpec, hw: HardwareSpec, w: Workload, top_k: int = 10,
         # optimal layer split (+ ±1 neighborhood)
         ls_opt = optimal_layer_split(m, hw, w, tp_s, pp, dw)
         seen = {tuple(ls_uniform)}
-        for delta in range(-2, 3):
+        for delta in range(-3, 4):      # ±3 around the closed-form optimum
             ls = ls_opt[:]
             ls[0] += delta
             ls[-1] -= delta
@@ -577,33 +695,57 @@ def validate(csv_path: Path = CALIB_CSV):
         meas = float(row["tps"])
         if meas <= 0:
             continue
+        # Hard operating rule: n_req ≤ 100 (above it the Ada small-partition rank
+        # OOMs into KV preemption/recompute thrashing — an unsupported regime the
+        # cost model does not represent; old n=128 sweeps predate the rule).
+        if int(row["n_req"]) > 100:
+            continue
         pred = predict(m, hw, w, cfg, overlap=True)
         if not pred["feasible"]:
             err = float("nan")
         else:
             err = (pred["tps"] - meas) / meas * 100
         by_model.setdefault(mkey, []).append((row["label"], row["workload"], meas,
-                                              pred.get("tps", 0), err))
-        print(f"{mkey:10s} {row['label'][:42]:42s} {row['workload']:14s} "
-              f"{meas:8.0f} {pred.get('tps', 0):8.0f} {err:7.1f}")
+                                              pred.get("tps", 0), err,
+                                              int(row["n_req"])))
 
     print("\n==== MAPE per model ====")
     for mkey, lst in by_model.items():
-        errs = [abs(e) for _, _, _, _, e in lst if not math.isnan(e)]
+        errs = [abs(e) for _, _, _, _, e, _ in lst if not math.isnan(e)]
         print(f"{mkey:10s} n={len(errs):3d}  MAPE={sum(errs)/len(errs):6.1f}%")
 
-    # champion match check
-    print("\n==== champion match (per model × workload) ====")
+    # champion match + regret per (model, workload, n_req). n_req is part of the
+    # key because the champion crosses over with load (TP8 at low n → TP4PP2 at
+    # high n); lumping n_req would compare configs optimal at different points.
+    print("\n==== champion match + regret per (model × workload × n_req) ====")
+    match = total = 0
+    regrets = []
+    reg_by_n = {}
     for mkey, lst in by_model.items():
-        wls = sorted({wl for _, wl, _, _, _ in lst})
-        for wl in wls:
-            sub = [(lab, meas, pred) for lab, w2, meas, pred, _ in lst if w2 == wl]
+        keys = sorted({(wl, nr) for _, wl, _, _, _, nr in lst})
+        for wl, nr in keys:
+            sub = [(lab, meas, pred) for lab, w2, meas, pred, _, n2 in lst
+                   if w2 == wl and n2 == nr]
             if not sub:
                 continue
-            meas_champ = max(sub, key=lambda x: x[1])[0]
+            meas_champ, mc_tps, _ = max(sub, key=lambda x: x[1])
             pred_champ = max(sub, key=lambda x: x[2])[0]
-            ok = "✓" if meas_champ == pred_champ else "✗"
-            print(f"{ok} {mkey:10s} {wl:14s} measured={meas_champ[:36]:36s} predicted={pred_champ[:36]}")
+            pc_meas = next(meas for lab, meas, _ in sub if lab == pred_champ)
+            regret = (mc_tps - pc_meas) / mc_tps * 100
+            ok = meas_champ == pred_champ
+            match += ok; total += 1
+            regrets.append(regret)
+            reg_by_n.setdefault(nr, []).append((ok, regret))
+            if not ok:
+                print(f"  ✗ {mkey:10s} {wl:13s} n={nr:>3d} "
+                      f"meas={meas_champ[:26]:26s} pred={pred_champ[:26]:26s} "
+                      f"regret={regret:5.1f}%")
+    import numpy as _np
+    print(f"\n  champion {match}/{total}; mean regret {_np.mean(regrets):.1f}% "
+          f"median {_np.median(regrets):.1f}% max {_np.max(regrets):.1f}%")
+    print("  by n_req:  " + "  ".join(
+        f"n={nr}:{sum(o for o,_ in v)}/{len(v)},reg{_np.mean([r for _,r in v]):.0f}%"
+        for nr, v in sorted(reg_by_n.items())))
 
 
 # ----------------------------------------------------------------------------
