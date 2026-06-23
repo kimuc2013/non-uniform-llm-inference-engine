@@ -1,0 +1,13 @@
+model,workload,label,topology,regime,tps,tps_per_B,delta_vs_tp8_uniform
+70b,balanced,TP4PP2_layer_skew+4_44-36,TP4 PP2,overlap,1727.906508,24.49194199858257,23.987020867393394
+70b,decode_heavy,TP4PP2_layer_skew+16_56-24,TP4 PP2,overlap,1683.063718,23.8563248476258,14.614916353203345
+70b,prefill_heavy,TP8PP1_ffn_bias+50,TP8 PP1,n/a,1368.736015,19.40093571934798,18.536869116261176
+8b,balanced,TP4PP2_layer_uniform_16-16,TP4 PP2,overlap,3036.332297,378.12357372353677,88.8584857584589
+8b,decode_heavy,TP4PP2_layer_skew+2_18-14,TP4 PP2,overlap,3886.610135,484.0112247820673,125.2348703563005
+8b,prefill_heavy,TP4PP2_layer_uniform_16-16,TP4 PP2,overlap,2107.093432,262.4026689912827,40.196148176701776
+opt30b,balanced,TP8PP1_ffn_bias+25,TP8 PP1,n/a,645.923047,21.530768233333333,1.0032015293118488
+opt30b,decode_heavy,TP8PP1_uniform,TP8 PP1,n/a,692.52805,23.084268333333334,0.0
+opt30b,prefill_heavy,TP8PP1_uniform,TP8 PP1,n/a,612.542047,20.418068233333333,0.0
+qwen32b,balanced,(no data),-,-,,,
+qwen32b,decode_heavy,(no data),-,-,,,
+qwen32b,prefill_heavy,(no data),-,-,,,

@@ -1,0 +1,43 @@
+{
+  "model": "mistralai/Mistral-Large-Instruct-2411",
+  "note": "PRE-REGISTERED prediction vs measured. Prediction frozen in mistral_prediction.json BEFORE this sweep existed.",
+  "results_dir": "results/hetero_4x4_mistral123b_full_20260616_211558",
+  "per_workload": {
+    "balanced": {
+      "predicted_champion": "TP4PP2_layer_skew+12_56-32",
+      "predicted_champion_tps": 805.3,
+      "measured_champion": "TP4PP2_layer_skew+12_56-32",
+      "measured_champion_tps": 993.8,
+      "predicted_champ_measured_tps": 993.8,
+      "regret_pct": 0.0,
+      "champion_match": true,
+      "spearman": 0.753
+    },
+    "decode_heavy": {
+      "predicted_champion": "TP4PP2_layer_skew+12_56-32",
+      "predicted_champion_tps": 906.0,
+      "measured_champion": "TP4PP2_layer_skew+12_56-32",
+      "measured_champion_tps": 1028.9,
+      "predicted_champ_measured_tps": 1028.9,
+      "regret_pct": 0.0,
+      "champion_match": true,
+      "spearman": 0.903
+    },
+    "prefill_heavy": {
+      "predicted_champion": "TP4PP2_layer_skew+12_56-32",
+      "predicted_champion_tps": 587.2,
+      "measured_champion": "TP4PP2_layer_skew+12_56-32",
+      "measured_champion_tps": 898.1,
+      "predicted_champ_measured_tps": 898.1,
+      "regret_pct": 0.0,
+      "champion_match": true,
+      "spearman": 0.852
+    }
+  },
+  "summary": {
+    "champion_match": "3/3",
+    "mean_regret_pct": 0.0,
+    "max_regret_pct": 0.0,
+    "mean_spearman": 0.836
+  }
+}

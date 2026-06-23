@@ -245,6 +245,11 @@ MODEL_PARAMS_B: dict[str, float] = {
     "meta-llama/Llama-3.3-70B-Instruct": 70.0,
     "meta-llama/Llama-3.1-405B-Instruct": 405.0,
     "Qwen/Qwen3-235B-A22B": 235.0,
+    "Qwen/Qwen3-32B": 32.0,
+    "mistralai/Mistral-Large-Instruct-2411": 123.0,
+    "mistralai/Mistral-Large-Instruct-2407": 123.0,
+    "Qwen/Qwen2.5-7B-Instruct": 7.0,
+    "Qwen/Qwen3-8B": 8.0,
     "facebook/opt-30b": 30.0,
 }
 

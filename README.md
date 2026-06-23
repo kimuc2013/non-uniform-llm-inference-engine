@@ -1,106 +1,103 @@
-# vllm_main — Heterogeneous TP/PP serving on vLLM
+# Heterogeneous TP/PP serving on vLLM — non-uniform parallelism + analytical planner
 
-Research framework for benchmarking **non-uniform tensor + pipeline parallelism**
-across a heterogeneous GPU cluster (e.g. 4× Blackwell head + 4× Ada worker).
-Includes a cost-model-based planner that picks (TP, PP) and per-stage layer /
-FFN / head splits, and an end-to-end sweep harness that compares against stock
-vLLM as the SOTA baseline.
+Research framework for **non-uniform tensor + pipeline parallelism** on a
+heterogeneous GPU cluster (developed on 4× Blackwell-96GB head + 4× Ada-48GB
+worker, cross-node IB). It contains: (1) vLLM source patches that enable
+non-uniform TP shards + a fast PP-overlap path, (2) an **analytical planner**
+that predicts throughput and picks `(TP, PP, per-rank FFN/head splits,
+per-stage layer split)`, and (3) a generalized measurement sweep + plotting.
 
-Paper claim: hetero clusters benefit from **non-uniform** PP layer splits +
-per-stage TP sharding; the right partition is workload-dependent and a small
-cost model can pick it within a few percent of measured optimum.
+**Paper thesis:** *hybrid parallelism is not always best* — the optimal topology
+and the value of non-uniform partitioning are workload-, model-, and
+hardware-dependent, and a small calibrated cost model can pick within a few
+percent of the measured optimum.
 
-## Layout
+## Headline results
+- **Pre-registered planner validation on Mistral-Large-123B** (predicted *before*
+  any measurement, model ~1.8× the largest calibration model): **champion 3/3,
+  mean regret 0.0%, Spearman 0.84** vs measured. → `results/final/mistral_prereg_vs_measured.json`, `figures/fig_mistral123b_prereg.png`.
+- **PP overlap fork**: cross-node PP reaches **56–78%** overlap (stock vLLM 12–24%);
+  70B 100-req **+16%** throughput. (M13 side-stream sampled-token broadcast = 2×.)
+- **Non-uniform TP**: helps **+7–13%** depending on regime; gain grows as TP degree
+  shrinks (more per-rank weight, smaller AR floor) — e.g. 70B balanced TP8 **+6.3%**
+  (8 GPU) vs TP4 **+12.9%** (4 GPU). Non-uniform PP (layer skew) **+23%** on 2+2.
+- Across 4 calibration models the champion is almost always **TP4-PP2 (overlap)**,
+  but **70B prefill prefers TP8+FFN-bias** — i.e. not always hybrid.
 
+## Repo layout (post-cleanup 2026-06)
 ```
-launcher/           vLLM launcher wrapper — reads cluster.local.env
-perf/               request-driver (TPS, TTFT, ITL) + NVTX trace analyzers
-planner/            ★ main entry points
-  cluster_env.py        load cluster.local.env (single source of truth)
-  cluster_setup_4x4.py  idempotent ray restart on both nodes
-  hetero_4x4_70b_sweep.py   70B sweep (TP8/PP1, TP4/PP2 with layer skew, TP2/PP4)
-  hetero_4x4_8b_sweep.py    same configs, Llama-3.1 8B
-  auto_sweep_robust.sh      autonomous runner: PP verify → full sweeps with retry
-  plot_4x4_results.py       matplotlib figures from sweep results
-  planner.py / cost_model.py / scorer.py / model_spec.py / workload.py / gpu_library.py
-  network_library.py / hetero_eval.py / run_eval.py / cli.py
-asim_etgen/         ASTRA-sim execution-trace generator for the same workloads
-results/final/      committed: aggregated CSVs (no intermediate cells)
-figures/            committed: matplotlib figures from the 4+4 sweeps
+patches/
+  vllm-0.22.0-hetero-tp-pp.patch   ★ all vLLM source changes (11 files, +1707/-90)
+  APPLY.md                          how to re-apply on a fresh vLLM 0.22.0
+planner/                            ★ analytical planner (v2) + sweep + plots
+  perf_planner.py        closed-form TPS predict / plan() / --validate / --predict-mistral / CLI
+  fit_planner.py         fit free params to calibration_data.csv (robust, leave-one-model-out)
+  build_calibration.py   (re)build calibration_data.csv from results/
+  hetero_sweep.py        ★ generalized measurement sweep (any model × GPU layout)
+  cluster_env.py         typed cluster config (reads cluster.local.env)
+  cluster_setup_4x4.py   idempotent Ray restart on both nodes
+  plot_*.py              matplotlib figures
+  *_pp_overlap_*.py       PP-overlap verification (nsys / torch-profiler)
+  PLANNER_SPEC.md        the full cost-model derivation (roofline + AR + overlap + memory)
+  HANDOFF.md             ★ detailed running status / next steps (read first to resume)
+  hw_params.json         calibrated effective HW params (per-GPU TFLOPS/BW, AR, overlap)
+  fitted_params.json     fitted engine params (ar, step_floor, overlap, prefill_overlap)
+  calibration_data.csv   211-row measured calibration (model × config × workload)
+  mistral_prediction.json / mistral_validation.json   pre-registration + comparison
+  legacy_v1/             archived v1 cost-model planner + one-off diagnostics + old per-model sweeps
+launcher/                vLLM launcher wrapper + pp_overlap_config.py (PP-overlap auto-tuner)
+perf/                    request driver (TPS/TTFT/ITL) + NVTX trace analyzers
+asim_etgen/              ASTRA-sim execution-trace generator for the same workloads
+results/final/           committed curated CSVs (per-model sweeps + Mistral validation)
+figures/                 committed figures
+cluster.example.env      copy to cluster.local.env (gitignored) and fill in
 ```
+vLLM is **not** vendored — install 0.22.0 and apply the patch (keeps this a thin delta).
 
-## Setup
-
-1. Install vLLM (this work was developed against the local `vllm_main` fork —
-   any vLLM with the necessary hetero patches works).
-2. Apply the upstream hetero fix in `vllm/model_executor/warmup/kernel_warmup.py`
-   on every node. In a heterogeneous cluster, only ranks with compute
-   capability ≥ 9.0 originally entered `flashinfer_autotune`, which deadlocks
-   when other ranks skip it. Our patch coordinates via a CPU all-reduce so all
-   ranks make the same decision — see the patch file in commit history.
-3. Copy `cluster.example.env` to `cluster.local.env` (gitignored) and fill in
-   your cluster's IPs, GPU counts, fabric interfaces, and Python paths.
-
-## Running a full 4+4 sweep
-
+## Setup on a new server
 ```bash
-cd vllm_main
-# Sanity check: ensure both nodes are 4+4 in Ray
-python -m planner.cluster_env             # print loaded config
-python planner/cluster_setup_4x4.py       # idempotent — restart if not 4+4
-
-# Run everything (PP verify → 70B 27 cells → 8B 27 cells), auto-retry + restart on failure
-./planner/auto_sweep_robust.sh
+# 1. env + vLLM + patch
+pip install vllm==0.22.0   # plus deps: torch, ray, matplotlib, scipy, ...
+#    apply the source patch onto the installed vLLM — see patches/APPLY.md
+# 2. cluster config (no secrets in the repo)
+cp cluster.example.env cluster.local.env   # edit: IPs, GPU counts, IB ifaces, python paths
+# 3. bring up Ray (cross-node). Per-node NCCL/GLOO ifaces matter:
+#    head:   NCCL_SOCKET_IFNAME=<head_iface>  ray start --head --node-ip-address=<head_fabric_ip> --port=6379 [--num-gpus N]
+#    worker: NCCL_SOCKET_IFNAME=<worker_iface> ray start --address=<head>:6379 --node-ip-address=<worker_fabric_ip> --num-gpus N
+#    (planner/cluster_setup_4x4.py automates this; `ray status` must show head+worker GPUs)
 ```
 
-Aggregate + plot:
+## Run a sweep (generalized)
 ```bash
-python planner/plot_4x4_results.py        # writes figures/*.png
+python planner/hetero_sweep.py --model 70b                          # 4+4, full topology grid, 3 workloads
+python planner/hetero_sweep.py --model 70b --head-gpus 2 --worker-gpus 2 --workloads balanced
+python planner/hetero_sweep.py --model mistral123b --dry-run        # print the config grid, no launch
 ```
+Model dims come from `planner.perf_planner.MODELS`; the config grid (TP=world
+FFN-bias + TP×PP layer-skew, Blackwell-biased) is generated from dims + layout.
+Hard rules are baked in: CUDA graphs ON, `gpu_mem 0.85`, HF offline (gated-model
+safe), PP overlap via the launcher auto-tuner only. Outputs land in
+`results/hetero_<H>x<W>_<model>_<ts>/` (gitignored; curate into `results/final/`).
 
-## Single sweep cell (for debugging)
-
+## The planner
 ```bash
-python planner/hetero_4x4_70b_sweep.py \
-    --configs TP4PP2_layer_uniform_40-40 \
-    --workloads balanced
+python planner/perf_planner.py --model 70b --in-len 512 --out-len 256 --n-req 96   # rank configs by predicted TPS
+python planner/perf_planner.py --validate          # vs calibration_data.csv (MAPE + regret + champion)
+python planner/fit_planner.py                       # refit free params; reports regret / Spearman / LOMO
 ```
+Reported as **regret / optimality-gap** (not exact top-1, which is noise-limited on
+flat curves) + Spearman + MAPE. See `PLANNER_SPEC.md` for the model and the
+documented residual gaps (TP8-prefill under-prediction; small-model overhead regime).
 
-## Reference numbers (4+4 cross-node, n_req=128)
+## Reproduce / resume
+- Curated results: `results/final/*.csv`, `figures/*.png`. Regenerate figures with `planner/plot_*.py`.
+- Recalibrate on a new cluster: run the ≤6-cell probe set (PLANNER_SPEC §8) →
+  update `hw_params.json` → `fit_planner.py` → `perf_planner.py --validate`.
+- **To resume (or hand to a fresh Claude Code session): read `planner/HANDOFF.md` first**
+  — running status, done/pending, infra gotchas (HF gated-model load needs
+  `HF_HUB_OFFLINE=1`; per-node IB ifaces; Ray restart), and the file map.
 
-These are from the committed `results/final/sweep_4x4_70b.csv` and
-`sweep_4x4_8b.csv`. All cells passed `success=true`; full reproduction
-requires the matching cluster.local.env.
-
-Stock vLLM PP=2 baseline (no PP overlap envs): 1280 TPS on TP=4 PP=2 [40,40]
-balanced 70B 128-req. All TP=4 PP=2 cells in the sweep beat this.
-
-### 70B Llama-3.3 highlights
-- TP=4 PP=2 [44,36] balanced: 1544 TPS (best balanced)
-- TP=4 PP=2 [56,24] decode_heavy: 1655 TPS (best decode, +9% over uniform)
-- TP=2 PP=4 always loses (PP bubble cost > skew gain on this cluster)
-
-### 8B Llama-3.1 highlights
-- TP=4 PP=2 dominates cross-node TP=8 (3.2× on uniform, up to 4× on decode)
-- TP=4 PP=2 [22,10] decode_heavy: 7108 TPS / [24,8]: 7194 TPS (peak)
-- Aggressive skew helps decode, hurts prefill — sweet spot is workload-specific
-
-## Key system findings baked in
-
-- **Heterogeneous cluster requires `flashinfer_autotune` patch** (see Setup §2).
-  Without it, mixed-cap clusters deadlock at init.
-- **PP overlap envs** (`VLLM_PP_OVERLAP`, `VLLM_PP_MICROBATCH_*`, `VLLM_PP_FAST_COMM`)
-  give a +7–18% bump on stable clusters but were disabled in the public sweep
-  because repeated `ray restart` corrupts NCCL state and they hang. Keep them
-  for stable measurement runs only.
-- **`mb_size = max_num_seqs / pp`** — too small fragments weights into many
-  reads per step (32× amplification on 70B); the sweep uses
-  `microbatch_size = 64` for `n_req=128, PP=2`.
-- **Worker GPU visibility**: if the physical worker has more GPUs than the
-  experiment requires, restart Ray on the worker with
-  `CUDA_VISIBLE_DEVICES=0,1,2,3 ray start --num-gpus=4` so the scheduler
-  doesn't accidentally pack all bundles onto one node.
-
-## License & status
-
-Internal research code; no warranty.
+## Hard rules (do not violate for reported numbers)
+CUDA graphs ON (never `--enforce-eager`); `gpu_mem 0.85`; `n_req ≤ 100` (Ada
+small-partition rank OOMs above); PP overlap only via
+`launcher/pp_overlap_config.auto_configure`.

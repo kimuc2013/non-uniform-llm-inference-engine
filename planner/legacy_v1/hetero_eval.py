@@ -411,9 +411,7 @@ def execute_run(r: HeteroRun, run_dir: Path, timeout_s: float) -> bool:
 
     max_num_seqs = max(64, r.n_requests)
     max_model_len = 2048 if r.cell.model_alias == "opt30b" else 4096
-    # Worker is using GPU 4-7 (other user has 0-3). For 70B cross-node init
-    # we need extra headroom; smaller models keep the same value.
-    gpu_mem = 0.45 if r.cell.model_alias == "llama70b" else 0.60
+    gpu_mem = 0.85
 
     try:
         h = launch_vllm_ray(

@@ -9,7 +9,12 @@ USAGE:
 from __future__ import annotations
 import os
 import subprocess
+import sys
 import time
+from pathlib import Path
+_REPO = Path(__file__).resolve().parents[1]
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 from planner.cluster_env import CFG
 
 HEAD_IP = CFG.head_fabric_ip
@@ -23,18 +28,25 @@ WORKER_PY = CFG.worker_py
 
 
 def _check_cluster() -> tuple[bool, str]:
-    """Return (is_4x4, message). Does not raise."""
+    """Return (is_4x4, message). Stale-tolerant: if multiple alive nodes per
+    IP exist (transient during restart), keep the largest-GPU entry."""
     try:
         import ray
         if not ray.is_initialized():
             ray.init(address=RAY_ADDR, ignore_reinit_error=True)
         nodes = [n for n in ray.nodes() if n.get('alive')]
-        by_ip = {n['NodeManagerAddress']: n.get('Resources', {}).get('GPU', 0) for n in nodes}
+        by_ip: dict[str, float] = {}
+        for n in nodes:
+            ip = n['NodeManagerAddress']
+            g = n.get('Resources', {}).get('GPU', 0)
+            # take the max per IP, not the sum — protects against duplicate
+            # alive entries during ray restart races
+            by_ip[ip] = max(by_ip.get(ip, 0), g)
         head = by_ip.get(HEAD_IP, 0)
         worker = by_ip.get(WORKER_IP, 0)
-        total = sum(by_ip.values())
-        ok = (head == 4 and worker == 4 and total == 8)
-        return ok, f"total={total} head={head} worker={worker}"
+        ok = (head == 4 and worker == 4)
+        total = head + worker  # report deduped total
+        return ok, f"head={head} worker={worker} (deduped per-IP)"
     except Exception as e:
         return False, f"ray.init/nodes failed: {e}"
 
@@ -61,16 +73,25 @@ def _restart_worker_via_ray() -> None:
         # Worker uses vllm_main env (symlink to vllm_new on worker); its ray binary:
         worker_ray = CFG.worker_ray
         cvd = CFG.worker_cuda_visible_devices
+        # Retry loop: head GCS may not be up yet by the time worker tries
+        # `ray start`. Retry up to 12 times with 10s spacing (≈2 min budget).
+        head_host, head_port = RAY_ADDR.split(':')
         cmd = (
             "sleep 3 && "
             f"{worker_ray} stop --force 2>&1 | tail -5 && "
-            "sleep 10 && "
+            "sleep 5 && "
             f"export CUDA_VISIBLE_DEVICES={cvd} && "
             f"export VLLM_HOST_IP={WORKER_IP} && "
             f"export NCCL_SOCKET_IFNAME={WORKER_IB} && "
             f"export NCCL_IB_HCA={CFG.nccl_ib_hca} && "
-            f"{worker_ray} start --address={RAY_ADDR} "
-            f"--node-ip-address={WORKER_IP} --num-gpus={CFG.worker_gpus} 2>&1 | tail -10"
+            "for i in $(seq 1 12); do "
+            f"  if timeout 3 bash -c 'cat </dev/tcp/{head_host}/{head_port}' 2>/dev/null; then "
+            f"    {worker_ray} start --address={RAY_ADDR} "
+            f"--node-ip-address={WORKER_IP} --num-gpus={CFG.worker_gpus} 2>&1 | tail -10 && break; "
+            "  fi; "
+            "  echo \"[worker_restart] head GCS not reachable yet, retry $i/12\"; "
+            "  sleep 10; "
+            "done"
         )
         # Launch fully detached so it survives this actor dying
         subprocess.Popen(

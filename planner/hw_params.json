@@ -1,0 +1,38 @@
+{
+  "blackwell": {
+    "eff_tflops_prefill": 578,
+    "eff_membw_decode_gbs": 1400,
+    "mem_gb": 96
+  },
+  "ada": {
+    "eff_tflops_prefill": 366,
+    "eff_membw_decode_gbs": 707,
+    "mem_gb": 48
+  },
+  "prefill_ar_overlap": 0.8,
+  "interconnect": {
+    "ar_latency_us": 150,
+    "ar_bw_gbs": 10.0,
+    "p2p_latency_us": 200,
+    "p2p_bw_gbs": 10.0
+  },
+  "overlap": {
+    "pp2_gain_bal": 1.036,
+    "pp2_gain_dec": 1.044,
+    "pp2_gain_pre": 1.094
+  },
+  "notes": [
+    "All values are EFFECTIVE (fitted to measured sweep records under results/hetero_4x4_*_full_*), not vendor spec. Anchor model = Llama-70B cells (most saturated); 8B/OPT30B add a per-step overhead floor; qwen32b TP8/PP cells are pathological outliers and were excluded.",
+    "DECODE BW (per GPU): from 70B TP1PP8 decode_heavy n=128 assuming pp=8 weight passes/round. Ada: uniform 10x8 (tps 632.8, round 202.3ms) -> 8x17.64GB weights + 4.03GB KV = 143.1GB / 202.3ms = 707 GB/s (74% of 960 spec). Blackwell: blackbias 14:6 (tps 840.4, round 152.3ms) -> 200.4GB/152.3ms = 1316 GB/s busy-bound lower bound; sweet-ratio 2.33 x 707 = 1648 upper; adopted 1400 (78% of 1800 spec). OPT30B 8:4 cross-check: Blackwell >= 1264, Ada >= 632.",
+    "CROSS-NODE ALLREDUCE: anchored on 70B TP8PP1 decode_heavy (itl 83.3ms, n=128): mem 27.3-27.8ms at 707GB/s -> (83.3-27.8)/160 ARs = ~350us per 2.10MB AR. Split as lat 150us + msg/10GB/s (IB-physical algbw). Joint 3-param LSQ over 4 models is DEGENERATE (rms 34-38%, hits bounds) because TP8 step time is nearly flat 68->88ms from 8B to 70B: cross-node TP8 decode is AR/overhead-bound, not weight-BW-bound (naive all-memory implied BW: 8B 41, 70B 236, OPT 134, qwen 55 GB/s).",
+    "SMALL-MODEL STEP FLOOR: with ar(150us,10GB/s)+BW 707, residual per-step floor = 47.7ms (8B, itl 68.0) and 47.9ms (OPT30B, itl 87.7) -- remarkably consistent; 70B floor = -2ms. Planner should add step_floor_ms ~= 48 for models <= ~30B at cross-node TP8; equivalently effective per-AR there is 750-1000us.",
+    "QWEN32B OUTLIER: TP8 itl 170.4ms (residual floor 121ms vs 48ms for 8B/OPT) and TP1PP8 cells show 15-198s TTFTs (preemption/thrash); qwen TP4PP2 cells are healthy (uniform dec 1765.6 tok/s, itl 71.3ms) -- only its cross-node-TP8/PP4+/PP8 cells are broken. Excluded from all fits.",
+    "CROSS-vs-INTRA AR PREMIUM (PP boundary value): 8B TP8 (68.0ms, 64 cross ARs) vs TP4PP2 (round 34.7ms, 64 intra ARs + 2 P2P, 2x weight passes, mem corr -2.8ms) -> premium ~563us/AR = 1.13ms/layer per 128-tok step. 70B check: TP8 83.3ms vs TP4PP2 round 86.0ms (mem corr -24.5ms) -> premium ~136us/AR (consistent: cross 350us - intra ~200us). This is why TP4PP2 wins for 8B (3685.7 vs 1725.6 dec) but is near-parity for 70B at PP-stock (1487.7 vs 1468.5): doubling weight passes costs 70B ~25ms/round, eating the AR savings.",
+    "P2P: not independently identifiable from this sweep (TP4PP2 round-time slack bounds 2 boundary messages of 2.1MB at < ~1-2ms incl. handshake); values are nominal IB-class. Treat as prior, not fit.",
+    "PREFILL TFLOPS: Ada 183 = 70B TP8PP1 prefill_heavy (rt 14.19s, 147456 tokens x 141.1 GFLOP/tok = 2.08e16 FLOP -> 1466 TF cluster / 8 ranks; per-rank equal work, Ada binding). Note: matches Ada's real dense bf16 fp32-acc spec ~182.5 TF (the '91' figure is the FP32 rate) -- mixed chunked-prefill steps run at the roofline because prefill GEMMs share weight reads with decode. Blackwell 289 = 70B TP4PP2 skew+16 (56-24) prefill (rt 12.6s, Blackwell stage 56/80 of FLOPs on 4 GPUs, busy-bound); skew+12 gives 258; ratio-implied upper 2.33x183=426. 8B TP8 prefill = 27 TF/GPU (overhead-bound, excluded).",
+    "PREFILL TFLOPS REVISION (2026-06-13): values DOUBLED to Blackwell 578 / Ada 366. The original 289/183 were back-derived under a phase-ADDITIVE wall model (T_total = T_prefill + T_decode), which double-counts because prefill (tensor-core bound) and decode (HBM bound) run on disjoint resources and partially overlap under chunked continuous batching (see PLANNER_SPEC.md §5, prefill_overlap ρ). Under the corrected max-blend model the prefill GEMMs run at ~bf16-accumulate peak: Ada 366 = 2x the fp32-acc 183 (datasheet bf16-acc rate); Blackwell 578 keeps the layer-split-derived 1.58 ratio. An independent free-parameter fit landed at 1.98x (Ada->362) confirming this. Cross-node TP AllReduce in prefill is ~80% hidden under the GEMMs (async-TP / sequence-parallel): prefill_ar_overlap=0.8.",
+    "ADA:BLACKWELL EFFECTIVE PER-LAYER RATIO (layer-split planning): decode 2.0-2.33 (70B TP1PP8 best 14:6=2.33 all workloads; 70B TP4PP2 dec best 56:24=2.33; OPT 8:4=2.0; qwen TP4PP2 48:16=3.0 noisy), prefill 1.67-2.33 (8B 5:3, OPT 16:8=2.0, qwen 44:20=2.2, 70B 56:24=2.33). Recommend 2.33 for 70B-class, 2.0 for 30B-class. Membw ratio here = 1400/707 = 1.98; tflops ratio = 289/183 = 1.58; observed optima exceed both because Ada also carries KV + AR burden.",
+    "OVERLAP GAINS: 70B TP4PP2 uniform 40-40, stock dir 122900 vs overlap dir 170850: bal 1408.9->1459.6 (+3.6%), dec 1487.7->1552.9 (+4.4%), pre 1205.3->1319.1 (+9.4%). Skewed-cell pairs are noisier (skew+12 dec +6.5%, skew+16 dec +4.2%, but skew+4 bal flips sign); use uniform pairs as the calibrated gain.",
+    "Workload defs: decode_heavy in128/out512, balanced in512/out256, prefill_heavy in1024/out128; n_req=128 except OPT30B=64. KV bytes/token/rank at TP8: 8B 16.4KB, 70B 81.9KB, qwen 32.8KB, OPT30B (MHA, 7 kv heads/rank) 172KB; avg decode ctx = in + out/2 = 384."
+  ]
+}

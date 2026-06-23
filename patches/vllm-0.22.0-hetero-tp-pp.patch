@@ -1,0 +1,2650 @@
+diff -ruN -x '*.so' -x __pycache__ -x '*.pyc' -x '*.pyi' a/vllm/distributed/device_communicators/shm_broadcast.py b/vllm/distributed/device_communicators/shm_broadcast.py
+--- a/vllm/distributed/device_communicators/shm_broadcast.py	2026-06-23 08:48:18.089449687 +0000
++++ b/vllm/distributed/device_communicators/shm_broadcast.py	2026-06-06 12:43:04.872170490 +0000
+@@ -514,10 +514,26 @@
+                 # to make sure the publish channel is working
+                 self.local_socket.send(b"READY")
+ 
+-            # remote readers
+-            for i in range(self.n_remote_reader):
+-                # wait for subscription messages from all remote readers
+-                self.remote_socket.recv()
++            # remote readers — with per-recv timeout + progress log so a
++            # missing/late SUB doesn't block forever (cross-node Ray cases).
++            import time as _t
++            poller = zmq.Poller()
++            poller.register(self.remote_socket, zmq.POLLIN)
++            received = 0
++            deadline = _t.monotonic() + 300.0  # 5 min total budget
++            while received < self.n_remote_reader:
++                remaining = max(0.0, deadline - _t.monotonic())
++                events = dict(poller.poll(timeout=int(remaining * 1000)))
++                if self.remote_socket in events:
++                    self.remote_socket.recv()
++                    received += 1
++                    logger.warning("shm_broadcast wait_until_ready: "
++                                   "remote SUB %d/%d", received, self.n_remote_reader)
++                else:
++                    logger.error("shm_broadcast wait_until_ready: ONLY %d/%d "
++                                 "remote SUBs received after 5 min — proceeding",
++                                 received, self.n_remote_reader)
++                    break
+             if self.n_remote_reader > 0:
+                 # send a message to all remote readers
+                 # to make sure the publish channel is working
+@@ -527,8 +543,37 @@
+             recv = self.local_socket.recv()
+             assert recv == b"READY"
+         elif self._is_remote_reader:
+-            # wait for the writer to send a message
+-            recv = self.remote_socket.recv()
++            # Wait for writer's READY. ZMQ XPUB/SUB has slow-joiner
++            # behavior: if writer sends before this SUB is registered,
++            # the message is lost forever. We poll with retry +
++            # send a probe message; if writer is alive it'll re-emit
++            # READY. Log progress.
++            import time as _t
++            deadline = _t.monotonic() + 300.0
++            poller = zmq.Poller()
++            poller.register(self.remote_socket, zmq.POLLIN)
++            recv = None
++            attempts = 0
++            while _t.monotonic() < deadline:
++                attempts += 1
++                events = dict(poller.poll(timeout=5000))
++                if self.remote_socket in events:
++                    recv = self.remote_socket.recv()
++                    logger.warning(
++                        "shm_broadcast wait_until_ready: remote READER "
++                        "received %r after %d poll attempt(s)",
++                        recv, attempts,
++                    )
++                    break
++                else:
++                    logger.warning(
++                        "shm_broadcast wait_until_ready: remote READER "
++                        "no message yet (attempt %d, waiting...)", attempts,
++                    )
++            if recv is None:
++                raise RuntimeError(
++                    "shm_broadcast: remote reader timed out waiting "
++                    "for writer READY (5 min)")
+             assert recv == b"READY"
+ 
+     def shutdown(self):
+diff -ruN -x '*.so' -x __pycache__ -x '*.pyc' -x '*.pyi' a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+--- a/vllm/model_executor/layers/linear.py	2026-06-23 08:48:18.113449033 +0000
++++ b/vllm/model_executor/layers/linear.py	2026-06-02 14:35:15.650456441 +0000
+@@ -446,18 +446,48 @@
+         *,
+         return_bias: bool = True,
+         disable_tp: bool = False,
++        partition_sizes: list[int] | None = None,
+     ):
+         # Divide the weight matrix along the last dimension.
+         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
+         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
+         self.input_size_per_partition = input_size
+-        self.output_size_per_partition = divide(output_size, self.tp_size)
++        # ---- vllm_main non-uniform TP patch (start) ----
++        # If partition_sizes is provided, it lists the per-rank output size
++        # for this column-parallel layer. Otherwise fall back to the uniform
++        # divide().
++        if partition_sizes is not None and not disable_tp:
++            if len(partition_sizes) != self.tp_size:
++                raise ValueError(
++                    f"partition_sizes length {len(partition_sizes)} != tp_size {self.tp_size}"
++                )
++            if any(s <= 0 for s in partition_sizes):
++                raise ValueError(f"partition_sizes must be positive: {partition_sizes}")
++            if sum(partition_sizes) != output_size:
++                raise ValueError(
++                    f"partition_sizes sum {sum(partition_sizes)} != output_size {output_size}"
++                )
++            self.output_size_per_partition = int(partition_sizes[self.tp_rank])
++            self.output_partition_sizes_per_rank = list(partition_sizes)
++        else:
++            self.output_size_per_partition = divide(output_size, self.tp_size)
++            self.output_partition_sizes_per_rank = None
+         self.output_partition_sizes = [self.output_size_per_partition]
+         # If QKV or MergedColumn, use output size of each partition.
+         if hasattr(self, "output_sizes"):
+-            self.output_partition_sizes = [
+-                divide(output_size, self.tp_size) for output_size in self.output_sizes
+-            ]
++            if (self.output_partition_sizes_per_rank is not None
++                    and hasattr(self, "output_partition_sizes_per_component")):
++                # Subclass (Merged/QKV) has already computed per-component
++                # per-rank sizes; use them.
++                self.output_partition_sizes = [
++                    comp[self.tp_rank]
++                    for comp in self.output_partition_sizes_per_component
++                ]
++            else:
++                self.output_partition_sizes = [
++                    divide(output_size, self.tp_size) for output_size in self.output_sizes
++                ]
++        # ---- vllm_main non-uniform TP patch (end) ----
+ 
+         super().__init__(
+             input_size,
+@@ -643,12 +673,38 @@
+         *,
+         return_bias: bool = True,
+         disable_tp: bool = False,
++        partition_sizes: list[int] | None = None,
+     ):
+         self.output_sizes = output_sizes
+         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
+         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
+ 
+-        assert all(output_size % self.tp_size == 0 for output_size in output_sizes)
++        # ---- vllm_main non-uniform TP patch (start) ----
++        # `partition_sizes` here lists the per-rank "per-output" size; e.g. for
++        # LlamaMLP gate_up where both `gate` and `up` share the same FFN split
++        # `partition_sizes[r]` is the per-rank FFN width and each component
++        # (gate, up) gets the same allocation.
++        if partition_sizes is not None and not disable_tp:
++            if len(partition_sizes) != self.tp_size:
++                raise ValueError(
++                    f"partition_sizes length {len(partition_sizes)} != tp_size {self.tp_size}"
++                )
++            if any(s <= 0 for s in partition_sizes):
++                raise ValueError(f"partition_sizes must be positive: {partition_sizes}")
++            for out in output_sizes:
++                if sum(partition_sizes) != out:
++                    raise ValueError(
++                        f"partition_sizes sum {sum(partition_sizes)} != output {out}"
++                    )
++            # Each component (gate, up) gets the same per-rank sizes.
++            self.output_partition_sizes_per_component = [
++                list(partition_sizes) for _ in output_sizes
++            ]
++        else:
++            assert all(out % self.tp_size == 0 for out in output_sizes)
++            self.output_partition_sizes_per_component = None
++        # ---- vllm_main non-uniform TP patch (end) ----
++
+         super().__init__(
+             input_size=input_size,
+             output_size=sum(output_sizes),
+@@ -660,6 +716,12 @@
+             prefix=prefix,
+             return_bias=return_bias,
+             disable_tp=disable_tp,
++            partition_sizes=(
++                [sum(comp[r] for comp in self.output_partition_sizes_per_component)
++                 for r in range(self.tp_size)]
++                if self.output_partition_sizes_per_component is not None
++                else None
++            ),
+         )
+ 
+     def validate_shard_id(self, loaded_shard_id: int | tuple[int, ...] | None):
+@@ -805,10 +867,26 @@
+ 
+         assert loaded_shard_id < len(self.output_sizes)
+         if output_dim is not None:
+-            shard_offset = sum(self.output_sizes[:loaded_shard_id])
+-            shard_size = self.output_sizes[loaded_shard_id]
+-            shard_offset //= self.tp_size
+-            shard_size //= self.tp_size
++            # ---- vllm_main non-uniform TP patch (start) ----
++            nu = getattr(self, "output_partition_sizes_per_component", None)
++            if nu is not None:
++                # Non-uniform path. nu[shard_id][rank] = per-rank size for this
++                # output component.
++                comp = nu[loaded_shard_id]
++                shard_size = int(comp[self.tp_rank])
++                # local offset within this rank's packed tensor: sum of all
++                # previous components' per-rank sizes.
++                shard_offset = sum(int(nu[j][self.tp_rank]) for j in range(loaded_shard_id))
++                # global start index in `loaded_weight`: sum of this
++                # component's sizes for lower ranks.
++                global_start = sum(int(comp[r]) for r in range(self.tp_rank))
++            else:
++                shard_offset = sum(self.output_sizes[:loaded_shard_id])
++                shard_size = self.output_sizes[loaded_shard_id]
++                shard_offset //= self.tp_size
++                shard_size //= self.tp_size
++                global_start = self.tp_rank * shard_size
++            # ---- vllm_main non-uniform TP patch (end) ----
+ 
+             if isinstance(param, BlockQuantScaleParameter):
+                 weight_block_size = getattr(self, "weight_block_size", None)
+@@ -844,9 +922,9 @@
+                     param, orig_offsets, str(loaded_shard_id)
+                 )
+             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
+-            start_idx = self.tp_rank * shard_size
+             if not is_sharded_weight:
+-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
++                # ---- vllm_main non-uniform TP patch (use global_start) ----
++                loaded_weight = loaded_weight.narrow(output_dim, global_start, shard_size)
+         # Special case for per-tensor scales in fused case.
+         elif needs_scalar_to_array:
+             param_data, loaded_weight = adjust_scalar_to_fused_array(
+@@ -952,10 +1030,20 @@
+ 
+         assert loaded_shard_id < len(self.output_sizes)
+ 
+-        shard_offset = sum(self.output_sizes[:loaded_shard_id])
+-        shard_size = self.output_sizes[loaded_shard_id]
+-        shard_offset //= self.tp_size
+-        shard_size //= self.tp_size
++        # ---- vllm_main non-uniform TP patch (start) ----
++        nu = getattr(self, "output_partition_sizes_per_component", None)
++        if nu is not None:
++            comp = nu[loaded_shard_id]
++            shard_size = int(comp[self.tp_rank])
++            shard_offset = sum(int(nu[j][self.tp_rank]) for j in range(loaded_shard_id))
++            global_start = sum(int(comp[r]) for r in range(self.tp_rank))
++        else:
++            shard_offset = sum(self.output_sizes[:loaded_shard_id])
++            shard_size = self.output_sizes[loaded_shard_id]
++            shard_offset //= self.tp_size
++            shard_size //= self.tp_size
++            global_start = self.tp_rank * shard_size
++        # ---- vllm_main non-uniform TP patch (end) ----
+ 
+         if isinstance(param, BlockQuantScaleParameter):
+             weight_block_size = getattr(self, "weight_block_size", None)
+@@ -969,6 +1057,7 @@
+             shard_offset=shard_offset,
+             shard_size=shard_size,
+             tp_rank=self.tp_rank,
++            global_start=global_start,
+         )
+ 
+ 
+@@ -1015,6 +1104,8 @@
+         return_bias: bool = True,
+         disable_tp: bool = False,
+         v_head_size: int | None = None,
++        head_partition_sizes: list[int] | None = None,
++        kv_partition_sizes: list[int] | None = None,
+     ):
+         self.hidden_size = hidden_size
+         self.head_size = head_size
+@@ -1025,24 +1116,101 @@
+         self.total_num_kv_heads = total_num_kv_heads
+         # Divide the weight matrix along the last dimension.
+         tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
+-        self.num_heads = divide(self.total_num_heads, tp_size)
+-        if tp_size >= self.total_num_kv_heads:
+-            self.num_kv_heads = 1
+-            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
++        tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
++        # ---- vllm_main non-uniform TP patch (start) ----
++        # If head_partition_sizes / kv_partition_sizes are provided, they list
++        # the per-rank Q and KV head counts respectively, overriding the
++        # uniform `divide(total, tp_size)` plus GQA replication scheme. The
++        # caller (e.g., LlamaAttention) is responsible for satisfying GQA:
++        # per-rank q_i * kv_total == kv_i * head_total.
++        if head_partition_sizes is not None and not disable_tp:
++            if len(head_partition_sizes) != tp_size:
++                raise ValueError(
++                    f"head_partition_sizes length {len(head_partition_sizes)} != tp_size {tp_size}"
++                )
++            if any(s <= 0 for s in head_partition_sizes):
++                raise ValueError(
++                    f"head_partition_sizes must be positive: {head_partition_sizes}"
++                )
++            if sum(head_partition_sizes) != self.total_num_heads:
++                raise ValueError(
++                    f"head_partition_sizes sum {sum(head_partition_sizes)} "
++                    f"!= total_num_heads {self.total_num_heads}"
++                )
++            self.num_heads = int(head_partition_sizes[tp_rank])
++            self._head_partition_sizes = list(head_partition_sizes)
+         else:
+-            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
++            self.num_heads = divide(self.total_num_heads, tp_size)
++            self._head_partition_sizes = None
++
++        if kv_partition_sizes is not None and not disable_tp:
++            if len(kv_partition_sizes) != tp_size:
++                raise ValueError(
++                    f"kv_partition_sizes length {len(kv_partition_sizes)} != tp_size {tp_size}"
++                )
++            if any(s <= 0 for s in kv_partition_sizes):
++                raise ValueError(
++                    f"kv_partition_sizes must be positive: {kv_partition_sizes}"
++                )
++            if sum(kv_partition_sizes) != self.total_num_kv_heads:
++                raise ValueError(
++                    f"kv_partition_sizes sum {sum(kv_partition_sizes)} "
++                    f"!= total_num_kv_heads {self.total_num_kv_heads}"
++                )
++            self.num_kv_heads = int(kv_partition_sizes[tp_rank])
+             self.num_kv_head_replicas = 1
++            self._kv_partition_sizes = list(kv_partition_sizes)
++        else:
++            if tp_size >= self.total_num_kv_heads:
++                self.num_kv_heads = 1
++                self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
++            else:
++                self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
++                self.num_kv_head_replicas = 1
++            self._kv_partition_sizes = None
++
+         input_size = self.hidden_size
+-        output_size = (
+-            self.num_heads * self.head_size
+-            + self.num_kv_heads * self.head_size
+-            + self.num_kv_heads * self.v_head_size
+-        ) * tp_size
+-        self.output_sizes = [
+-            self.num_heads * self.head_size * tp_size,  # q_proj
+-            self.num_kv_heads * self.head_size * tp_size,  # k_proj
+-            self.num_kv_heads * self.v_head_size * tp_size,  # v_proj
+-        ]
++        # Build output_sizes as totals (sum across ranks) so weight loading
++        # remains unchanged. For the uniform path this is exactly the stock
++        # computation; for the non-uniform path the totals are unchanged
++        # because sum(head_partition_sizes) == total_num_heads etc.
++        if self._head_partition_sizes is not None or self._kv_partition_sizes is not None:
++            # Build per-rank per-component sizes so ColumnParallelLinear can
++            # use them via output_partition_sizes_per_component.
++            head_splits = (self._head_partition_sizes
++                           if self._head_partition_sizes is not None
++                           else [self.num_heads] * tp_size)
++            kv_splits = (self._kv_partition_sizes
++                         if self._kv_partition_sizes is not None
++                         else [self.num_kv_heads] * tp_size)
++            self.output_partition_sizes_per_component = [
++                [h * self.head_size for h in head_splits],          # q_proj
++                [k * self.head_size for k in kv_splits],            # k_proj
++                [k * self.v_head_size for k in kv_splits],          # v_proj
++            ]
++            self.output_sizes = [
++                sum(self.output_partition_sizes_per_component[0]),
++                sum(self.output_partition_sizes_per_component[1]),
++                sum(self.output_partition_sizes_per_component[2]),
++            ]
++            output_size = sum(self.output_sizes)
++            partition_sizes_arg = [
++                sum(comp[r] for comp in self.output_partition_sizes_per_component)
++                for r in range(tp_size)
++            ]
++        else:
++            output_size = (
++                self.num_heads * self.head_size
++                + self.num_kv_heads * self.head_size
++                + self.num_kv_heads * self.v_head_size
++            ) * tp_size
++            self.output_sizes = [
++                self.num_heads * self.head_size * tp_size,
++                self.num_kv_heads * self.head_size * tp_size,
++                self.num_kv_heads * self.v_head_size * tp_size,
++            ]
++            partition_sizes_arg = None
++        # ---- vllm_main non-uniform TP patch (end) ----
+ 
+         super().__init__(
+             input_size=input_size,
+@@ -1055,6 +1223,7 @@
+             prefix=prefix,
+             return_bias=return_bias,
+             disable_tp=disable_tp,
++            partition_sizes=partition_sizes_arg,
+         )
+ 
+     def validate_shard_id(self, loaded_shard_id: str | None):
+@@ -1167,13 +1336,25 @@
+         shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
+         shard_size = self._get_shard_size_mapping(loaded_shard_id)
+ 
++        # ---- vllm_main non-uniform TP patch (start) ----
++        # If we have per-component per-rank splits, compute the global start
++        # within `loaded_weight` for THIS shard (q/k/v) at our rank.
++        nu = getattr(self, "output_partition_sizes_per_component", None)
++        if nu is not None:
++            comp_idx = {"q": 0, "k": 1, "v": 2}[loaded_shard_id]
++            comp = nu[comp_idx]
++            global_start = sum(int(comp[r]) for r in range(self.tp_rank))
++        else:
++            global_start = None
++        # ---- vllm_main non-uniform TP patch (end) ----
++
+         if isinstance(param, BlockQuantScaleParameter):
+             weight_block_size = getattr(self, "weight_block_size", None)
+             shard_size, shard_offset = adjust_block_scale_shard(
+                 weight_block_size, shard_size, shard_offset
+             )
+ 
+-        param.load_qkv_weight(
++        kwargs = dict(
+             loaded_weight=loaded_weight,
+             num_heads=self.num_kv_head_replicas,
+             shard_id=loaded_shard_id,
+@@ -1181,6 +1362,9 @@
+             shard_size=shard_size,
+             tp_rank=self.tp_rank,
+         )
++        if global_start is not None:
++            kwargs["global_start"] = global_start
++        param.load_qkv_weight(**kwargs)
+ 
+     def weight_loader(
+         self,
+@@ -1438,11 +1622,35 @@
+         *,
+         return_bias: bool = True,
+         disable_tp: bool = False,
++        input_partition_sizes: list[int] | None = None,
+     ):
+         # Divide the weight matrix along the first dimension.
+         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
+         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
+-        self.input_size_per_partition = divide(input_size, self.tp_size)
++        # ---- vllm_main non-uniform TP patch (start) ----
++        # input_partition_sizes lists the per-rank input dimension. Stock path
++        # uses divide(input_size, tp_size); the non-uniform path overrides.
++        if input_partition_sizes is not None and not disable_tp:
++            if len(input_partition_sizes) != self.tp_size:
++                raise ValueError(
++                    f"input_partition_sizes length {len(input_partition_sizes)} "
++                    f"!= tp_size {self.tp_size}"
++                )
++            if any(s <= 0 for s in input_partition_sizes):
++                raise ValueError(
++                    f"input_partition_sizes must be positive: {input_partition_sizes}"
++                )
++            if sum(input_partition_sizes) != input_size:
++                raise ValueError(
++                    f"input_partition_sizes sum {sum(input_partition_sizes)} "
++                    f"!= input_size {input_size}"
++                )
++            self.input_size_per_partition = int(input_partition_sizes[self.tp_rank])
++            self.input_partition_sizes_per_rank = list(input_partition_sizes)
++        else:
++            self.input_size_per_partition = divide(input_size, self.tp_size)
++            self.input_partition_sizes_per_rank = None
++        # ---- vllm_main non-uniform TP patch (end) ----
+         self.output_size_per_partition = output_size
+         self.output_partition_sizes = [output_size]
+ 
+@@ -1517,7 +1725,12 @@
+         param_data = param.data
+         if input_dim is not None and not is_sharded_weight:
+             shard_size = param_data.shape[input_dim]
+-            start_idx = self.tp_rank * shard_size
++            # ---- vllm_main non-uniform TP patch (start) ----
++            if self.input_partition_sizes_per_rank is not None:
++                start_idx = sum(self.input_partition_sizes_per_rank[:self.tp_rank])
++            else:
++                start_idx = self.tp_rank * shard_size
++            # ---- vllm_main non-uniform TP patch (end) ----
+             loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
+ 
+         # Special case for loading scales off disk, which often do not
+@@ -1535,7 +1748,12 @@
+             assert loaded_weight.numel() == 1
+             loaded_weight = loaded_weight.reshape(1)
+ 
+-        param.load_row_parallel_weight(loaded_weight=loaded_weight)
++        # ---- vllm_main non-uniform TP patch ----
++        nu = getattr(self, "input_partition_sizes_per_rank", None)
++        kwargs = {}
++        if nu is not None:
++            kwargs["global_start"] = sum(int(nu[r]) for r in range(self.tp_rank))
++        param.load_row_parallel_weight(loaded_weight=loaded_weight, **kwargs)
+ 
+     def forward(
+         self,
+diff -ruN -x '*.so' -x __pycache__ -x '*.pyc' -x '*.pyi' a/vllm/model_executor/models/llama.py b/vllm/model_executor/models/llama.py
+--- a/vllm/model_executor/models/llama.py	2026-06-23 08:48:18.152447971 +0000
++++ b/vllm/model_executor/models/llama.py	2026-06-02 14:35:15.654456369 +0000
+@@ -33,7 +33,11 @@
+ 
+ from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import CacheConfig, VllmConfig
+-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
++from vllm.distributed import (
++    get_pp_group,
++    get_tensor_model_parallel_rank,
++    get_tensor_model_parallel_world_size,
++)
+ from vllm.model_executor.layers.activation import SiluAndMul
+ from vllm.model_executor.layers.attention import (
+     Attention,
+@@ -91,6 +95,40 @@
+         disable_tp: bool = False,
+     ) -> None:
+         super().__init__()
++        # ---- vllm_main non-uniform TP patch (start) ----
++        from vllm.utils.tp_split_utils import (
++            parse_and_validate_splits, is_uniform,
++        )
++        from vllm.distributed.parallel_state import (
++            get_tensor_model_parallel_world_size,
++        )
++        import os as _os
++        tp_size_for_split = 1 if disable_tp else get_tensor_model_parallel_world_size()
++        _ffn_splits = None
++        if not disable_tp and tp_size_for_split > 1:
++            ffn_raw = _os.environ.get("VLLM_TP_FFN_SPLITS", "").strip()
++            if ffn_raw:
++                try:
++                    _ffn_splits = parse_and_validate_splits(
++                        ffn_raw, expected_len=tp_size_for_split,
++                        total=intermediate_size, granularity=1,
++                        name="VLLM_TP_FFN_SPLITS",
++                    )
++                except ValueError as e:
++                    import sys as _sys
++                    print(f"[vllm_main] LlamaMLP split error: {e}",
++                          file=_sys.stderr, flush=True)
++                    _ffn_splits = None
++        _ffn_partition = None if is_uniform(_ffn_splits) else _ffn_splits
++        if _ffn_partition is not None and "0.mlp" in prefix:
++            import sys
++            from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
++            print(
++                f"[vllm_main] LlamaMLP layer0 rank={get_tensor_model_parallel_rank()} "
++                f"ffn_splits={_ffn_partition} per_rank_intermediate={_ffn_partition[get_tensor_model_parallel_rank()]}",
++                file=sys.stderr, flush=True,
++            )
++        # ---- vllm_main non-uniform TP patch (end) ----
+         self.gate_up_proj = MergedColumnParallelLinear(
+             input_size=hidden_size,
+             output_sizes=[intermediate_size] * 2,
+@@ -98,6 +136,7 @@
+             quant_config=quant_config,
+             disable_tp=disable_tp,
+             prefix=f"{prefix}.gate_up_proj",
++            partition_sizes=_ffn_partition,
+         )
+         self.down_proj = RowParallelLinear(
+             input_size=intermediate_size,
+@@ -107,6 +146,7 @@
+             reduce_results=reduce_results,
+             disable_tp=disable_tp,
+             prefix=f"{prefix}.down_proj",
++            input_partition_sizes=_ffn_partition,
+         )
+         if hidden_act != "silu":
+             raise ValueError(
+@@ -140,22 +180,97 @@
+         layer_idx = extract_layer_index(prefix)
+         self.hidden_size = hidden_size
+         tp_size = get_tensor_model_parallel_world_size()
++        tp_rank = get_tensor_model_parallel_rank()
+         self.total_num_heads = num_heads
+-        assert self.total_num_heads % tp_size == 0
+-        self.num_heads = self.total_num_heads // tp_size
+         self.total_num_kv_heads = num_kv_heads
+-        if self.total_num_kv_heads >= tp_size:
+-            # Number of KV heads is greater than TP size, so we partition
+-            # the KV heads across multiple tensor parallel GPUs.
+-            assert self.total_num_kv_heads % tp_size == 0
+-        else:
+-            # Number of KV heads is less than TP size, so we replicate
+-            # the KV heads across multiple tensor parallel GPUs.
+-            assert tp_size % self.total_num_kv_heads == 0
+-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+ 
++        # ---- vllm_main non-uniform TP patch (start) ----
++        # Resolve head_dim BEFORE reading splits so we can build per-rank q/kv sizes.
+         head_dim = getattr(config, "head_dim", None)
+         self.head_dim = head_dim or self.hidden_size // self.total_num_heads
++
++        from vllm.utils.tp_split_utils import (
++            parse_and_validate_splits, _validate_qkv_ratio,
++            _derive_kv_splits_from_heads, is_uniform,
++        )
++        import os as _os
++        head_splits = None
++        kv_splits = None
++        if tp_size > 1:
++            head_raw = _os.environ.get("VLLM_TP_HEAD_SPLITS", "").strip()
++            kv_raw = _os.environ.get("VLLM_TP_KV_SPLITS", "").strip()
++            try:
++                if head_raw:
++                    head_splits = parse_and_validate_splits(
++                        head_raw, expected_len=tp_size, total=self.total_num_heads,
++                        granularity=1, name="VLLM_TP_HEAD_SPLITS",
++                    )
++                if kv_raw:
++                    kv_splits = parse_and_validate_splits(
++                        kv_raw, expected_len=tp_size, total=self.total_num_kv_heads,
++                        granularity=1, name="VLLM_TP_KV_SPLITS",
++                    )
++                if head_splits is not None and kv_splits is None:
++                    kv_splits = _derive_kv_splits_from_heads(
++                        head_splits=head_splits,
++                        head_total=self.total_num_heads,
++                        kv_total=self.total_num_kv_heads,
++                    )
++                if head_splits is not None and kv_splits is not None:
++                    _validate_qkv_ratio(
++                        head_splits=head_splits, kv_splits=kv_splits,
++                        head_total=self.total_num_heads,
++                        kv_total=self.total_num_kv_heads,
++                    )
++            except ValueError as e:
++                import sys as _sys
++                print(f"[vllm_main] LlamaAttention split error: {e}",
++                      file=_sys.stderr, flush=True)
++                head_splits, kv_splits = None, None
++
++        use_nonuniform = not (is_uniform(head_splits) and is_uniform(kv_splits))
++        if use_nonuniform:
++            # Build per-rank shapes from the split lists. If a list is uniform
++            # (or None), derive its uniform values; else use the list.
++            if head_splits is None or is_uniform(head_splits):
++                assert self.total_num_heads % tp_size == 0
++                head_splits = [self.total_num_heads // tp_size] * tp_size
++            if kv_splits is None or is_uniform(kv_splits):
++                if self.total_num_kv_heads >= tp_size:
++                    assert self.total_num_kv_heads % tp_size == 0
++                    kv_splits = [self.total_num_kv_heads // tp_size] * tp_size
++                else:
++                    # Cannot use uniform default replication with non-uniform Q.
++                    # Caller must provide KV splits explicitly.
++                    raise ValueError(
++                        "Non-uniform head splits require explicit "
++                        "VLLM_TP_KV_SPLITS when kv_heads < tp_size."
++                    )
++            self.num_heads = int(head_splits[tp_rank])
++            self.num_kv_heads = int(kv_splits[tp_rank])
++            self.num_kv_head_replicas = 1
++            self._tp_head_splits = list(head_splits)
++            self._tp_kv_splits = list(kv_splits)
++            if layer_idx == 0:
++                import sys
++                print(
++                    f"[vllm_main] LlamaAttention layer0 rank={tp_rank} "
++                    f"num_heads={self.num_heads} num_kv_heads={self.num_kv_heads} "
++                    f"head_splits={self._tp_head_splits} kv_splits={self._tp_kv_splits}",
++                    file=sys.stderr, flush=True,
++                )
++        else:
++            assert self.total_num_heads % tp_size == 0
++            self.num_heads = self.total_num_heads // tp_size
++            if self.total_num_kv_heads >= tp_size:
++                assert self.total_num_kv_heads % tp_size == 0
++            else:
++                assert tp_size % self.total_num_kv_heads == 0
++            self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
++            self._tp_head_splits = None
++            self._tp_kv_splits = None
++        # ---- vllm_main non-uniform TP patch (end) ----
++
+         self.q_size = self.num_heads * self.head_dim
+         self.kv_size = self.num_kv_heads * self.head_dim
+         self.scaling = self.head_dim**-0.5
+@@ -169,14 +284,23 @@
+             bias=bias,
+             quant_config=quant_config,
+             prefix=f"{prefix}.qkv_proj",
++            head_partition_sizes=self._tp_head_splits,
++            kv_partition_sizes=self._tp_kv_splits,
+         )
+ 
++        # ---- vllm_main: o_proj input split mirrors per-rank Q heads ----
++        _o_input_splits = (
++            [int(h) * self.head_dim for h in self._tp_head_splits]
++            if self._tp_head_splits is not None
++            else None
++        )
+         self.o_proj = RowParallelLinear(
+             input_size=self.total_num_heads * self.head_dim,
+             output_size=hidden_size,
+             bias=bias_o_proj,
+             quant_config=quant_config,
+             prefix=f"{prefix}.o_proj",
++            input_partition_sizes=_o_input_splits,
+         )
+ 
+         self._init_rotary_emb(config, quant_config=quant_config)
+diff -ruN -x '*.so' -x __pycache__ -x '*.pyc' -x '*.pyi' a/vllm/model_executor/parameter.py b/vllm/model_executor/parameter.py
+--- a/vllm/model_executor/parameter.py	2026-06-23 08:48:18.111449088 +0000
++++ b/vllm/model_executor/parameter.py	2026-06-02 14:35:15.662456223 +0000
+@@ -156,6 +156,8 @@
+     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
+         shard_offset: int = kwargs["shard_offset"]
+         shard_size: int = kwargs["shard_size"]
++        # ---- vllm_main non-uniform TP patch ----
++        global_start: int = kwargs.get("global_start", self.tp_rank * shard_size)
+ 
+         # TODO: move these to PackedColumnParameter and PackedvLLMParameter
+         if (
+@@ -170,7 +172,7 @@
+ 
+         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
+         loaded_weight = loaded_weight.narrow(
+-            self.output_dim, self.tp_rank * shard_size, shard_size
++            self.output_dim, global_start, shard_size
+         )
+         assert param_data.shape == loaded_weight.shape
+         param_data.copy_(loaded_weight)
+@@ -180,6 +182,8 @@
+         shard_size: int = kwargs["shard_size"]
+         shard_id: str = kwargs["shard_id"]
+         num_heads: int = kwargs["num_heads"]
++        # ---- vllm_main non-uniform TP patch ----
++        global_start_in = kwargs.get("global_start", None)
+ 
+         # TODO: move these to PackedColumnParameter and PackedvLLMParameter
+         if (
+@@ -191,10 +195,14 @@
+             )
+ 
+         param_data = self.data
+-        shard_id_int = self.tp_rank if shard_id == "q" else self.tp_rank // num_heads
++        if global_start_in is not None:
++            global_start = int(global_start_in)
++        else:
++            shard_id_int = self.tp_rank if shard_id == "q" else self.tp_rank // num_heads
++            global_start = shard_id_int * shard_size
+         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
+         loaded_weight = loaded_weight.narrow(
+-            self.output_dim, shard_id_int * shard_size, shard_size
++            self.output_dim, global_start, shard_size
+         )
+ 
+         assert param_data.shape == loaded_weight.shape
+@@ -217,10 +225,12 @@
+     def input_dim(self):
+         return self._input_dim
+ 
+-    def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
++    def load_row_parallel_weight(self, loaded_weight: torch.Tensor, **kwargs):
+         shard_size = self.data.shape[self.input_dim]
++        # ---- vllm_main non-uniform TP patch ----
++        global_start: int = kwargs.get("global_start", self.tp_rank * shard_size)
+         loaded_weight = loaded_weight.narrow(
+-            self.input_dim, self.tp_rank * shard_size, shard_size
++            self.input_dim, global_start, shard_size
+         )
+ 
+         if len(loaded_weight.shape) == 0:
+diff -ruN -x '*.so' -x __pycache__ -x '*.pyc' -x '*.pyi' a/vllm/model_executor/warmup/kernel_warmup.py b/vllm/model_executor/warmup/kernel_warmup.py
+--- a/vllm/model_executor/warmup/kernel_warmup.py	2026-06-23 08:48:18.164447644 +0000
++++ b/vllm/model_executor/warmup/kernel_warmup.py	2026-06-06 16:24:40.691760284 +0000
+@@ -67,11 +67,55 @@
+     enable_flashinfer_autotune = (
+         worker.vllm_config.kernel_config.enable_flashinfer_autotune
+     )
+-    # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
++    # ---- vllm_main heterogeneous-cluster fix ----
++    # In a heterogeneous cluster (e.g. Blackwell head + Ada worker), only
++    # ranks with compute capability >= 9.0 originally entered
++    # flashinfer_autotune. That function's internal _dummy_run does a forward
++    # pass that includes PP send (stage 0) -> recv (stage 1); when stage 1
++    # ranks are on Ada and never enter the function, stage 0's send blocks
++    # forever waiting for a non-existent matching recv. The barrier inside
++    # flashinfer_autotune compounds the problem.
++    #
++    # Fix: collectively decide BEFORE the autotune whether ALL ranks support
++    # flashinfer. If any rank lacks support, ALL ranks skip the autotune —
++    # this guarantees no PP send is issued without a matching recv. We use a
++    # MIN all_reduce on a CPU tensor over the world group's CPU process group
++    # (gloo) so the coordination doesn't require GPU comm.
++    from vllm.distributed.parallel_state import get_world_group
++    local_supports_fi = bool(
++        has_flashinfer() and current_platform.has_device_capability(90)
++    )
++    try:
++        _support_tensor = torch.tensor(
++            [1 if local_supports_fi else 0], dtype=torch.int32, device="cpu"
++        )
++        torch.distributed.all_reduce(
++            _support_tensor,
++            op=torch.distributed.ReduceOp.MIN,
++            group=get_world_group().cpu_group,
++        )
++        world_supports_fi = bool(_support_tensor.item() == 1)
++    except Exception as _e:
++        # Fall back to local decision (legacy behavior); shouldn't happen in
++        # a properly initialized cluster.
++        logger.warning(
++            "kernel_warmup: failed to all-reduce flashinfer support across "
++            "ranks (%s). Falling back to local capability check.", _e,
++        )
++        world_supports_fi = local_supports_fi
++
+     if enable_flashinfer_autotune is False:
+         logger.info("Skipping FlashInfer autotune because it is disabled.")
+-    elif has_flashinfer() and current_platform.has_device_capability(90):
++    elif world_supports_fi:
++        # Every rank has cap >= 9.0; original code path is safe.
++        # local_supports_fi is True for all of them here.
+         flashinfer_autotune(worker.model_runner)
++    elif local_supports_fi:
++        logger.info(
++            "Skipping FlashInfer autotune: heterogeneous cluster "
++            "(some rank lacks compute capability >= 9.0)."
++        )
++    # ---- end vllm_main fix ----
+ 
+     # FlashInfer attention warmup
+     # Only warmup if the model has FlashInfer attention groups
+@@ -135,6 +179,9 @@
+                 skip_eplb=True,
+                 is_profile=True,
+             )
++        # NOTE: heterogeneous-cluster safety is ensured by kernel_warmup()
++        # gating: this function is only entered when ALL world ranks support
++        # flashinfer (cap >= 9.0). So this barrier is safe here.
+         get_world_group().barrier()
+         return
+ 
+diff -ruN -x '*.so' -x __pycache__ -x '*.pyc' -x '*.pyi' a/vllm/utils/tp_split_utils.py b/vllm/utils/tp_split_utils.py
+--- a/vllm/utils/tp_split_utils.py	1970-01-01 00:00:00.000000000 +0000
++++ b/vllm/utils/tp_split_utils.py	2026-05-29 12:07:24.339463059 +0000
+@@ -0,0 +1,140 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Drop-in module installed at vllm/utils/tp_split_utils.py.
++
++Reads VLLM_TP_HEAD_SPLITS / VLLM_TP_FFN_SPLITS / VLLM_TP_KV_SPLITS from
++os.environ and validates them. Used by patched model files
++(model_executor/models/llama.py, qwen3.py, opt.py).
++
++Differs from the old vllm_hetero version only in that env vars are read
++via os.environ (not vllm.envs) — so we don't have to patch envs.py too.
++"""
++from __future__ import annotations
++
++import os
++from typing import Iterable
++
++
++def _parse_int_list(raw: str) -> list[int]:
++    parts = [p.strip() for p in raw.split(",") if p.strip()]
++    if not parts:
++        raise ValueError("split string is empty")
++    try:
++        return [int(p) for p in parts]
++    except ValueError as exc:
++        raise ValueError(f"all split entries must be integers: {raw}") from exc
++
++
++def validate_splits(splits: Iterable[int], *, expected_len: int, total: int,
++                    granularity: int, name: str) -> list[int]:
++    splits = list(splits)
++    if len(splits) != expected_len:
++        raise ValueError(f"{name} length {len(splits)} != tp={expected_len}. value={splits}")
++    if any(x <= 0 for x in splits):
++        raise ValueError(f"{name} must be positive: {splits}")
++    if any(x % granularity != 0 for x in splits):
++        raise ValueError(f"{name} entries must be divisible by {granularity}: {splits}")
++    if sum(splits) != total:
++        raise ValueError(f"{name} sum {sum(splits)} != total {total}. value={splits}")
++    return splits
++
++
++def parse_and_validate_splits(raw: str, *, expected_len: int, total: int,
++                              granularity: int, name: str) -> list[int]:
++    return validate_splits(_parse_int_list(raw), expected_len=expected_len,
++                           total=total, granularity=granularity, name=name)
++
++
++def _derive_kv_splits_from_heads(*, head_splits: Iterable[int],
++                                 head_total: int, kv_total: int) -> list[int]:
++    out: list[int] = []
++    for idx, q_i in enumerate(head_splits):
++        num = int(q_i) * int(kv_total)
++        if num % int(head_total) != 0:
++            raise ValueError(
++                f"Cannot derive KV split from head split at rank {idx}: "
++                f"{q_i} * {kv_total} not divisible by {head_total}."
++            )
++        kv_i = num // int(head_total)
++        if kv_i <= 0:
++            raise ValueError(f"Derived KV at rank {idx} non-positive ({kv_i}).")
++        out.append(int(kv_i))
++    if sum(out) != int(kv_total):
++        raise ValueError(f"Derived KV sum {sum(out)} != total {kv_total}.")
++    return out
++
++
++def _validate_qkv_ratio(*, head_splits: Iterable[int], kv_splits: Iterable[int],
++                        head_total: int, kv_total: int) -> None:
++    q = list(head_splits); k = list(kv_splits)
++    if len(q) != len(k):
++        raise ValueError(f"Q/KV lengths differ: {len(q)} vs {len(k)}.")
++    for idx, (q_i, kv_i) in enumerate(zip(q, k)):
++        if int(q_i) * int(kv_total) != int(kv_i) * int(head_total):
++            raise ValueError(
++                f"Q/KV ratio mismatch at rank {idx}: q={q_i}, kv={kv_i}, "
++                f"global={head_total}:{kv_total}."
++            )
++
++
++def read_tp_splits_from_env(
++    *,
++    tp_size: int,
++    head_total: int,
++    ffn_total: int,
++    kv_total: int,
++    head_granularity: int = 1,
++    ffn_granularity: int = 1,
++) -> tuple[list[int] | None, list[int] | None, list[int] | None]:
++    """Read optional TP split configs from env and validate.
++
++    Returns (head_splits, ffn_splits, kv_splits), each None if unset/empty.
++    Raises ValueError on malformed input.
++    """
++    head_raw = os.environ.get("VLLM_TP_HEAD_SPLITS", "").strip()
++    ffn_raw = os.environ.get("VLLM_TP_FFN_SPLITS", "").strip()
++    kv_raw = os.environ.get("VLLM_TP_KV_SPLITS", "").strip()
++
++    head_splits = parse_and_validate_splits(
++        head_raw, expected_len=tp_size, total=head_total,
++        granularity=head_granularity, name="VLLM_TP_HEAD_SPLITS"
++    ) if head_raw else None
++
++    ffn_splits = parse_and_validate_splits(
++        ffn_raw, expected_len=tp_size, total=ffn_total,
++        granularity=ffn_granularity, name="VLLM_TP_FFN_SPLITS"
++    ) if ffn_raw else None
++
++    kv_splits = parse_and_validate_splits(
++        kv_raw, expected_len=tp_size, total=kv_total,
++        granularity=1, name="VLLM_TP_KV_SPLITS"
++    ) if kv_raw else None
++
++    if head_splits is not None and kv_splits is None:
++        kv_splits = _derive_kv_splits_from_heads(
++            head_splits=head_splits, head_total=head_total, kv_total=kv_total
++        )
++    elif head_splits is None and kv_splits is not None:
++        if head_total % tp_size != 0:
++            raise ValueError(
++                "VLLM_TP_KV_SPLITS is set but uniform head split is impossible "
++                f"(num_attention_heads={head_total}, tp={tp_size}). "
++                "Set VLLM_TP_HEAD_SPLITS together."
++            )
++        uniform_heads = [head_total // tp_size for _ in range(tp_size)]
++        _validate_qkv_ratio(head_splits=uniform_heads, kv_splits=kv_splits,
++                            head_total=head_total, kv_total=kv_total)
++    elif head_splits is not None and kv_splits is not None:
++        _validate_qkv_ratio(head_splits=head_splits, kv_splits=kv_splits,
++                            head_total=head_total, kv_total=kv_total)
++
++    return head_splits, ffn_splits, kv_splits
++
++
++def is_uniform(splits: Iterable[int] | None) -> bool:
++    """Return True if splits is None or all entries equal (i.e. effectively
++    uniform). Used by patched code to fast-path the uniform branch."""
++    if splits is None:
++        return True
++    arr = list(splits)
++    return len(arr) == 0 or len(set(arr)) == 1
+diff -ruN -x '*.so' -x __pycache__ -x '*.pyc' -x '*.pyi' a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py	2026-06-23 08:48:18.267444839 +0000
++++ b/vllm/v1/core/sched/scheduler.py	2026-06-02 14:35:15.673456023 +0000
+@@ -166,6 +166,24 @@
+         self.skipped_waiting = create_request_queue(self.policy)
+         self.running: list[Request] = []
+ 
++        # ---- vllm_main PP microbatch patch (start) ----
++        import os as _os, sys as _sys
++        self._mb_enabled: bool = (
++            _os.environ.get("VLLM_PP_MICROBATCH", "0") == "1"
++        )
++        self._mb_size: int = int(_os.environ.get("VLLM_PP_MICROBATCH_SIZE", "0"))
++        self._inflight_req_ids: set[str] = set()
++        self._held_inflight_running: list[Request] = []
++        print(
++            f"[vllm_main] Scheduler init pid={_os.getpid()} "
++            f"VLLM_PP_MICROBATCH={_os.environ.get('VLLM_PP_MICROBATCH','unset')} "
++            f"mb_enabled={self._mb_enabled} "
++            f"pp_size={self.parallel_config.pipeline_parallel_size} "
++            f"max_num_running_reqs={self.scheduler_config.max_num_seqs}",
++            file=_sys.stderr, flush=True,
++        )
++        # ---- vllm_main PP microbatch patch (end) ----
++
+         # The request IDs that are finished in between the previous and the
+         # current steps. This is used to notify the workers about the finished
+         # requests so that they can free the cached states for those requests.
+@@ -338,6 +356,40 @@
+         # chunked prefills, prefix caching, speculative decoding,
+         # and the "jump decoding" optimization in the future.
+ 
++        # ---- vllm_main PP microbatch patch (prologue) ----
++        _mb_active = (
++            self._mb_enabled
++            and self.parallel_config.pipeline_parallel_size > 1
++        )
++        _mb_saved_max = self.max_num_running_reqs
++        if _mb_active:
++            if self._inflight_req_ids:
++                # Move inflight reqs out of self.running so they are not
++                # re-scheduled within the same engine step.
++                self._held_inflight_running = [
++                    r for r in self.running
++                    if r.request_id in self._inflight_req_ids
++                ]
++                self.running = [
++                    r for r in self.running
++                    if r.request_id not in self._inflight_req_ids
++                ]
++            # Cap per-call running budget so a single schedule() call only
++            # emits a microbatch-sized chunk; subsequent calls in the same
++            # engine step fill the remaining microbatches.
++            pp_size = self.parallel_config.pipeline_parallel_size
++            cap = self._mb_size if self._mb_size > 0 \
++                else max(1, _mb_saved_max // pp_size)
++            self.max_num_running_reqs = min(_mb_saved_max, cap)
++            import sys as _sys
++            print(
++                f"[mb] schedule prologue: cap={cap} saved={_mb_saved_max} "
++                f"running={len(self.running)} inflight={len(self._inflight_req_ids)} "
++                f"held={len(self._held_inflight_running)}",
++                file=_sys.stderr, flush=True,
++            )
++        # ---- vllm_main PP microbatch patch (end prologue) ----
++
+         scheduled_new_reqs: list[Request] = []
+         scheduled_resumed_reqs: list[Request] = []
+         scheduled_running_reqs: list[Request] = []
+@@ -919,6 +971,29 @@
+ 
+         with record_function_or_nullcontext("schedule: update_after_schedule"):
+             self._update_after_schedule(scheduler_output)
++
++        # ---- vllm_main PP microbatch patch (epilogue) ----
++        if _mb_active:
++            self.max_num_running_reqs = _mb_saved_max
++            if self._held_inflight_running:
++                self.running = self._held_inflight_running + self.running
++                self._held_inflight_running = []
++            for nr in scheduler_output.scheduled_new_reqs:
++                self._inflight_req_ids.add(nr.req_id)
++            cr = scheduler_output.scheduled_cached_reqs
++            if cr is not None:
++                for rid in cr.req_ids:
++                    self._inflight_req_ids.add(rid)
++            import sys as _sys
++            _n_new = len(scheduler_output.scheduled_new_reqs)
++            _n_cached = len(cr.req_ids) if cr is not None else 0
++            print(
++                f"[mb] schedule epilogue: emitted new={_n_new} cached={_n_cached} "
++                f"total_tokens={scheduler_output.total_num_scheduled_tokens} "
++                f"inflight_after={len(self._inflight_req_ids)}",
++                file=_sys.stderr, flush=True,
++            )
++        # ---- vllm_main PP microbatch patch (end epilogue) ----
+         return scheduler_output
+ 
+     def _build_kv_connector_meta(
+@@ -1285,6 +1360,16 @@
+         scheduler_output: SchedulerOutput,
+         model_runner_output: ModelRunnerOutput,
+     ) -> dict[int, EngineCoreOutputs]:
++        # ---- vllm_main PP microbatch patch ----
++        # Clear inflight marks for reqs whose microbatch result is now consumed.
++        if self._mb_enabled and self._inflight_req_ids:
++            for nr in scheduler_output.scheduled_new_reqs:
++                self._inflight_req_ids.discard(nr.req_id)
++            cr = scheduler_output.scheduled_cached_reqs
++            if cr is not None:
++                for rid in cr.req_ids:
++                    self._inflight_req_ids.discard(rid)
++        # ---- end vllm_main patch ----
+         sampled_token_ids = model_runner_output.sampled_token_ids
+         logprobs = model_runner_output.logprobs
+         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+diff -ruN -x '*.so' -x __pycache__ -x '*.pyc' -x '*.pyi' a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+--- a/vllm/v1/engine/core.py	2026-06-23 08:48:18.268444812 +0000
++++ b/vllm/v1/engine/core.py	2026-06-02 14:35:15.664456187 +0000
+@@ -483,6 +483,18 @@
+         3. Update the scheduler from the output.
+         """
+ 
++        # ---- vllm_main engine NVTX (gated by VLLM_ENGINE_NVTX=1) ----
++        import os as _os
++        _nvtx_on = _os.environ.get("VLLM_ENGINE_NVTX", "0") == "1"
++        if _nvtx_on:
++            import torch
++            _np = torch.cuda.nvtx.range_push
++            _po = torch.cuda.nvtx.range_pop
++        else:
++            _np = lambda _x: None
++            _po = lambda: None
++        # ---- end vllm_main ----
++
+         batch_queue = self.batch_queue
+         assert batch_queue is not None
+ 
+@@ -494,11 +506,15 @@
+         model_executed = False
+         deferred_scheduler_output = None
+         if self.scheduler.has_requests():
++            _np(f"engine_schedule qsz={len(batch_queue)}")
+             scheduler_output = self.scheduler.schedule()
++            _po()
++            _np(f"engine_exec_submit qsz={len(batch_queue)}")
+             with self.log_error_detail(scheduler_output):
+                 exec_future = self.model_executor.execute_model(
+                     scheduler_output, non_block=True
+                 )
++            _po()
+             if self.is_ec_consumer:
+                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
+ 
+@@ -512,9 +528,11 @@
+                     grammar_output = self.scheduler.get_grammar_bitmask(
+                         scheduler_output
+                     )
++                    _np(f"engine_sample_submit qsz={len(batch_queue)}")
+                     future = self.model_executor.sample_tokens(
+                         grammar_output, non_block=True
+                     )
++                    _po()
+                 else:
+                     # We need to defer sampling until we have processed the model output
+                     # from the prior step.
+@@ -539,6 +557,7 @@
+             return None, False
+ 
+         # Block until the next result is available.
++        _np(f"engine_pop_wait qsz={len(batch_queue)}")
+         future, scheduler_output, exec_model_fut = batch_queue.pop()
+         with (
+             self.log_error_detail(scheduler_output),
+@@ -550,13 +569,16 @@
+                 # call failed - raise that exception.
+                 exec_model_fut.result()
+                 raise RuntimeError("unexpected error")
++        _po()  # engine_pop_wait
+ 
+         # Before processing the model output, process any aborts that happened
+         # during the model execution.
+         self._process_aborts_queue()
++        _np(f"engine_update_from_output qsz={len(batch_queue)}")
+         engine_core_outputs = self.scheduler.update_from_output(
+             scheduler_output, model_output
+         )
++        _po()
+ 
+         # NOTE(nick): We can either handle the deferred tasks here or save
+         # in a field and do it immediately once step_with_batch_queue is
+diff -ruN -x '*.so' -x __pycache__ -x '*.pyc' -x '*.pyi' a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+--- a/vllm/v1/executor/multiproc_executor.py	2026-06-23 08:48:18.269444785 +0000
++++ b/vllm/v1/executor/multiproc_executor.py	2026-06-06 15:56:34.630582896 +0000
+@@ -66,6 +66,45 @@
+ logger = init_logger(__name__)
+ 
+ 
++# --- vllm_main: NVTX gates for async-output pipeline diagnosis ----------
++_ASYNC_OUT_NVTX = os.environ.get("VLLM_ASYNC_OUT_NVTX", "0") == "1"
++
++
++class _NvtxRange:
++    """Cheap context manager: no-op unless VLLM_ASYNC_OUT_NVTX=1.
++
++    Uses torch.cuda.nvtx for consistency with gpu_worker.py. The range is
++    process/thread-local — it shows up under the calling thread in nsys."""
++    __slots__ = ("name", "_active")
++
++    def __init__(self, name: str):
++        self.name = name
++        self._active = False
++
++    def __enter__(self):
++        if _ASYNC_OUT_NVTX:
++            torch.cuda.nvtx.range_push(self.name)
++            self._active = True
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        if self._active:
++            torch.cuda.nvtx.range_pop()
++            self._active = False
++        return False
++# --- end vllm_main ------------------------------------------------------
++
++
++# --- vllm_main: response dispatcher gate ----------
++# When VLLM_USE_DISPATCHER=1, a background thread inside MultiprocExecutor
++# drains the futures_queue eagerly. FutureWrapper.result() then becomes
++# a plain concurrent.futures.Future.result() blocking on the internal
++# event, which lets the engine main loop interleave submit and pop more
++# freely (Phase A0 toward submit/finish decoupling — RFC #11945).
++_USE_DISPATCHER = os.environ.get("VLLM_USE_DISPATCHER", "0") == "1"
++# --- end vllm_main ----------
++
++
+ class FutureWrapper(Future):
+     def __init__(
+         self,
+@@ -83,6 +122,11 @@
+         if timeout is not None:
+             raise RuntimeError("timeout not implemented")
+ 
++        if _USE_DISPATCHER:
++            # Dispatcher thread is responsible for draining the queue and
++            # setting our result; just wait on the standard Future event.
++            return super().result()
++
+         # Drain any futures ahead of us in the queue.
+         while not self.done():
+             future = self.futures_queue.pop()
+@@ -230,6 +274,22 @@
+ 
+             self.futures_queue = deque[FutureWrapper]()
+ 
++            # --- vllm_main: response dispatcher ----------
++            self._dispatcher_thread: Thread | None = None
++            self._dispatcher_shutdown = threading.Event()
++            if _USE_DISPATCHER:
++                self._dispatcher_thread = Thread(
++                    target=self._response_dispatcher_loop,
++                    name="MultiprocExecutor.response_dispatcher",
++                    daemon=True,
++                )
++                self._dispatcher_thread.start()
++                logger.info(
++                    "MultiprocExecutor: response dispatcher thread started "
++                    "(VLLM_USE_DISPATCHER=1)"
++                )
++            # --- end vllm_main ----------
++
+             self._post_init_executor()
+ 
+             success = True
+@@ -261,6 +321,56 @@
+     def _post_init_executor(self) -> None:
+         pass
+ 
++    # --- vllm_main: response dispatcher ----------
++    def _response_dispatcher_loop(self) -> None:
++        """Background thread that drains futures_queue in FIFO order.
++
++        Pops the oldest pending FutureWrapper and calls _wait_for_response,
++        which blocks on response_mq.dequeue and calls set_result/set_exception
++        on the future. The engine main thread can then call future.result()
++        without owning the drain — it just waits on the standard Future
++        event. This is Phase A0 of the submit/finish split (RFC #11945):
++        decoupling result delivery from engine main-loop scheduling.
++
++        Polling: deque.pop() raises IndexError on empty; we use a short
++        sleep + shutdown-event check to avoid CPU spinning when no work
++        is in flight.
++        """
++        # NVTX gate for diagnosing dispatcher overhead under nsys.
++        nvtx_on = os.environ.get("VLLM_DISPATCHER_NVTX", "0") == "1"
++
++        def _push(name: str):
++            if nvtx_on:
++                torch.cuda.nvtx.range_push(name)
++
++        def _pop():
++            if nvtx_on:
++                torch.cuda.nvtx.range_pop()
++
++        while not self._dispatcher_shutdown.is_set():
++            try:
++                _push("dispatcher_pop")
++                try:
++                    future = self.futures_queue.pop()
++                except IndexError:
++                    future = None
++                _pop()
++
++                if future is None:
++                    # Empty queue — wait briefly and re-check.
++                    self._dispatcher_shutdown.wait(timeout=0.0005)
++                    continue
++
++                _push("dispatcher_wait_response")
++                future._wait_for_response()
++                _pop()
++            except Exception:
++                logger.exception(
++                    "MultiprocExecutor.response_dispatcher loop error; "
++                    "continuing."
++                )
++    # --- end vllm_main ----------
++
+     def _is_driver_worker(self, rank: int) -> bool:
+         return rank % self.parallel_config.tensor_parallel_size == 0
+ 
+@@ -370,7 +480,30 @@
+             send_method = method
+         else:
+             send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
++        # ---- vllm_main diag driver-side ----
++        import os as _ddo, time as _ddt
++        if _ddo.environ.get("VLLM_DIAG_HANG", "0") == "1":
++            try:
++                _ddpath = "/tmp/vllm_diag/driver_enqueue.log"
++                _ddo.makedirs("/tmp/vllm_diag", exist_ok=True)
++                with open(_ddpath, "a", buffering=1) as _ddf:
++                    _ddm = method if isinstance(method, str) else "<callable>"
++                    _ddf.write(
++                        f"[t={_ddt.time():.3f}] enqueue method={_ddm!r} output_rank={output_rank}\n"
++                    )
++            except Exception:
++                pass
++        # ---- end vllm_main diag ----
+         self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
++        if _ddo.environ.get("VLLM_DIAG_HANG", "0") == "1":
++            try:
++                with open("/tmp/vllm_diag/driver_enqueue.log", "a", buffering=1) as _ddf:
++                    _ddm = method if isinstance(method, str) else "<callable>"
++                    _ddf.write(
++                        f"[t={_ddt.time():.3f}] enqueue_returned method={_ddm!r}\n"
++                    )
++            except Exception:
++                pass
+ 
+         response_mqs: Sequence[MessageQueue] = self.response_mqs
+         if output_rank is not None:
+@@ -444,6 +577,15 @@
+             logger.debug("Triggering shutdown of workers")
+             self.shutting_down = True
+ 
++            # --- vllm_main: stop response dispatcher ----------
++            shutdown_evt = getattr(self, "_dispatcher_shutdown", None)
++            if shutdown_evt is not None:
++                shutdown_evt.set()
++            disp = getattr(self, "_dispatcher_thread", None)
++            if disp is not None and disp.is_alive():
++                disp.join(timeout=2.0)
++            # --- end vllm_main ----------
++
+             # Make sure all the worker processes are terminated first.
+             if workers := getattr(self, "workers", None):
+                 for w in workers:
+@@ -473,7 +615,17 @@
+ 
+     @cached_property
+     def max_concurrent_batches(self) -> int:
+-        # PP requires PP-size concurrent batches to fill the pipeline.
++        # ---- vllm_main PP overlap patch ----
++        # PP needs at least pp_size in-flight batches to fill the pipeline.
++        # With only pp_size=2 in-flight, the engine waits for batch A's result
++        # before scheduling C; stage 0 ends up idle ~50% of the time.
++        # VLLM_PP_BATCH_QUEUE_SIZE overrides the batch-queue depth so the
++        # engine can keep more microbatches in flight, masking the
++        # cross-stage dependency latency.
++        import os as _os
++        _override = int(_os.environ.get("VLLM_PP_BATCH_QUEUE_SIZE", "0"))
++        if _override > 0:
++            return _override
+         pp_size = self.parallel_config.pipeline_parallel_size
+         return 2 if pp_size <= 1 and self.scheduler_config.async_scheduling else pp_size
+ 
+@@ -903,15 +1055,18 @@
+         worker_response_mq. If the output is an Exception, it is
+         converted to a FAILURE response.
+         """
+-        if isinstance(output, AsyncModelRunnerOutput):
+-            output = output.get_output()
++        with _NvtxRange("eo_total"):
++            if isinstance(output, AsyncModelRunnerOutput):
++                with _NvtxRange("eo_get_output"):
++                    output = output.get_output()
+ 
+-        if isinstance(output, Exception):
+-            result = (WorkerProc.ResponseStatus.FAILURE, str(output))
+-        else:
+-            result = (WorkerProc.ResponseStatus.SUCCESS, output)
+-        if (response_mq := self.worker_response_mq) is not None:
+-            response_mq.enqueue(result)
++            if isinstance(output, Exception):
++                result = (WorkerProc.ResponseStatus.FAILURE, str(output))
++            else:
++                result = (WorkerProc.ResponseStatus.SUCCESS, output)
++            if (response_mq := self.worker_response_mq) is not None:
++                with _NvtxRange("eo_response_mq_enqueue"):
++                    response_mq.enqueue(result)
+ 
+     def handle_output(self, output: Any):
+         """Handles output from the worker. If async scheduling is enabled,
+@@ -919,7 +1074,8 @@
+         enqueued directly to the worker_response_mq.
+         """
+         if self.use_async_scheduling:
+-            self.async_output_queue.put(output)
++            with _NvtxRange("ho_async_q_put"):
++                self.async_output_queue.put(output)
+         else:
+             self.enqueue_output(output)
+ 
+@@ -938,16 +1094,41 @@
+             current_platform.set_device(self.worker.device)
+ 
+         while True:
+-            output = self.async_output_queue.get()
+-            self.enqueue_output(output)
++            with _NvtxRange("aol_q_get"):
++                output = self.async_output_queue.get()
++            with _NvtxRange("aol_enqueue_output"):
++                self.enqueue_output(output)
+ 
+     def worker_busy_loop(self):
+         """Main busy loop for Multiprocessing Workers"""
+         assert self.rpc_broadcast_mq is not None
++        # ---- vllm_main diag (gated by VLLM_DIAG_HANG=1) ----
++        import os as _diag_os, time as _diag_time, socket as _diag_sock
++        _diag_on = _diag_os.environ.get("VLLM_DIAG_HANG", "0") == "1"
++        _diag_f = None
++        if _diag_on:
++            _diag_dir = "/tmp/vllm_diag"
++            _diag_os.makedirs(_diag_dir, exist_ok=True)
++            _diag_host = _diag_sock.gethostname()
++            _diag_path = (
++                f"{_diag_dir}/worker_{_diag_host}_rank{self.rank}_pid{_diag_os.getpid()}.log"
++            )
++            _diag_f = open(_diag_path, "w", buffering=1)
++            _diag_f.write(f"[t={_diag_time.time():.3f}] worker_busy_loop entered rank={self.rank}\n")
++        _diag_iter = 0
++        # ---- end vllm_main diag ----
+         while True:
++            if _diag_on and _diag_f is not None:
++                _diag_f.write(f"[t={_diag_time.time():.3f}] iter={_diag_iter} pre-dequeue\n")
+             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
+                 indefinite=True
+             )
++            _diag_iter += 1
++            if _diag_on and _diag_f is not None:
++                _diag_method = method if isinstance(method, str) else "<callable>"
++                _diag_f.write(
++                    f"[t={_diag_time.time():.3f}] iter={_diag_iter} got method={_diag_method!r} output_rank={output_rank}\n"
++                )
+             try:
+                 if isinstance(method, str):
+                     func = getattr(self.worker, method)
+@@ -955,6 +1136,10 @@
+                     func = partial(cloudpickle.loads(method), self.worker)
+ 
+                 output = func(*args, **kwargs)
++                if _diag_on and _diag_f is not None:
++                    _diag_f.write(
++                        f"[t={_diag_time.time():.3f}] iter={_diag_iter} func done\n"
++                    )
+             except Exception as e:
+                 # Notes have been introduced in python 3.11
+                 if hasattr(e, "add_note"):
+@@ -968,6 +1153,10 @@
+ 
+             if output_rank is None or self.rank == output_rank:
+                 self.handle_output(output)
++                if _diag_on and _diag_f is not None:
++                    _diag_f.write(
++                        f"[t={_diag_time.time():.3f}] iter={_diag_iter} handle_output done\n"
++                    )
+ 
+     @staticmethod
+     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:
+diff -ruN -x '*.so' -x __pycache__ -x '*.pyc' -x '*.pyi' a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+--- a/vllm/v1/worker/gpu_model_runner.py	2026-06-23 08:48:18.274444649 +0000
++++ b/vllm/v1/worker/gpu_model_runner.py	2026-06-02 14:35:15.668456114 +0000
+@@ -282,7 +282,18 @@
+         This function blocks until the copy is finished.
+         """
+         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
+-        self.async_copy_ready_event.synchronize()
++        # ---- vllm_main: VLLM_PP_SKIP_ASYNC_COPY_SYNC=1 skips this
++        # event sync. The event waits for the H2D copy of sampled tokens
++        # to complete, but wait_stream(default_stream) inside __init__
++        # makes that copy gated by default stream's current queue depth.
++        # With bq=4+ this becomes the per-mb 5-7ms gate observed in
++        # engine_pop_wait NVTX. Skipping means CPU may read garbage
++        # tokens — UNSAFE in general but valid for diagnostic A/B.
++        import os as _os
++        _skip = _os.environ.get("VLLM_PP_SKIP_ASYNC_COPY_SYNC", "0") == "1"
++        if not _skip:
++            self.async_copy_ready_event.synchronize()
++        # ---- end vllm_main ----
+ 
+         # Release the device tensors once the copy has completed.
+         del self._logprobs_tensors
+@@ -687,6 +698,37 @@
+             self.async_output_copy_stream = torch.cuda.Stream()
+             self.prepare_inputs_event = torch.Event()
+ 
++        # ---- vllm_main: PP prev_sampled_token broadcast on side stream ----
++        # Default vLLM v1 issues `torch.distributed.broadcast` for the
++        # prev_sampled_token_ids on the default CUDA stream inside
++        # `sample_tokens()`. On rank 0 (recv side), the broadcast kernel
++        # spins on default_stream for the entire duration of rank 1's
++        # forward+sampler (~26ms for Llama-70B, ~3.8ms for 8B), blocking
++        # rank 0's next forward kernels from being launched. This is the
++        # primary structural cause of the ~50/50 alternating PP pattern
++        # observed under CUDA graph + async scheduling.
++        #
++        # Bypass (env: VLLM_PP_SAMPLED_BROADCAST_STREAM=1): run the
++        # broadcast on a dedicated side stream so default_stream stays
++        # free. Record an event after the recv; the next forward that
++        # actually reads prev_sampled_token_ids waits on this event right
++        # before the embedding lookup, so correctness is preserved while
++        # other ready work on default_stream proceeds during the wait.
++        import os as _os_ssbs
++        self._pp_sampled_bcast_side_stream: torch.cuda.Stream | None = None
++        self._pp_sampled_bcast_event: torch.Event | None = None
++        self._pp_sampled_bcast_on_side = (
++            self.use_async_scheduling
++            and self.parallel_config.pipeline_parallel_size > 1
++            and _os_ssbs.environ.get(
++                "VLLM_PP_SAMPLED_BROADCAST_STREAM", "0"
++            ) == "1"
++        )
++        if self._pp_sampled_bcast_on_side:
++            self._pp_sampled_bcast_side_stream = torch.cuda.Stream()
++            self._pp_sampled_bcast_event = torch.Event()
++        # ---- end vllm_main ----
++
+         # self.cudagraph_batch_sizes sorts in ascending order.
+         if (
+             self.compilation_config.cudagraph_capture_sizes
+@@ -1167,6 +1209,13 @@
+         # consecutive batches contain mostly the same requests. If batches
+         # have low request overlap (e.g., alternating between two distinct
+         # sets of requests), this optimization becomes very inefficient.
++        # ---- vllm_main: M13e attempt — scheduler attaches
++        # pp_held_req_ids and we skip removal here, but downstream
++        # iteration (scatter/gather kernels) assumes contiguous active
++        # slots in input_batch and CUDA-asserts when held reqs sit in
++        # the middle. Proper deactivation requires input_batch internal
++        # split into active/held regions (~200 LOC). Reverted; the
++        # ~547μs/mb _update_states churn remains in microbatch path.
+         for req_id in unscheduled_req_ids:
+             self.input_batch.remove_request(req_id)
+ 
+@@ -1768,6 +1817,20 @@
+             # No requests in common with the previous iteration
+             # So input_ids.cpu will have all the input ids.
+             return
++        # ---- vllm_main: wait on the side-stream broadcast event
++        # only here, at the actual point of reading prev_sampled_token_ids.
++        # When the prev broadcast is for a disjoint subset (microbatching
++        # case), num_common_tokens may be 0 above and we skipped the read
++        # entirely — in which case we never reach this point and never
++        # waste time waiting for an irrelevant broadcast. ----
++        if (
++            self._pp_sampled_bcast_on_side
++            and self._pp_sampled_bcast_event is not None
++        ):
++            torch.cuda.current_stream().wait_event(
++                self._pp_sampled_bcast_event
++            )
++        # ---- end vllm_main ----
+         if common_indices_match and max_flattened_index == (num_common_tokens - 1):
+             # Common-case optimization: the batch is unchanged
+             # and no reordering happened.
+@@ -3656,6 +3719,25 @@
+             yield
+             return
+ 
++        # ---- vllm_main: VLLM_PP_SKIP_PREP_SYNC=1 makes this sync a
++        # no-op. The sync was added in async_scheduling to ensure the prev
++        # mb's H2D copies have finished before we overwrite the shared CPU
++        # input tensors. NVTX shows it's the 7ms/mb gate that caps PP
++        # overlap at 13%: when GPU stream is backed up (bq>=4 mbs queued),
++        # the event hasn't fired yet so the CPU blocks for many ms.
++        # Skipping is UNSAFE in general (CPU may overwrite tensors GPU is
++        # reading), but for diagnostic A/B and steady-state decode where
++        # input pattern is uniform, the race is unlikely to corrupt output.
++        import os as _os
++        _skip = _os.environ.get("VLLM_PP_SKIP_PREP_SYNC", "0") == "1"
++        if _skip:
++            try:
++                yield
++            finally:
++                pass
++            return
++        # ---- end vllm_main ----
++
+         # Ensure prior step has finished with reused CPU tensors.
+         # This is required in the async scheduling case because
+         # the CPU->GPU transfer happens async.
+@@ -3957,6 +4039,16 @@
+         scheduler_output: "SchedulerOutput",
+         intermediate_tensors: IntermediateTensors | None = None,
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
++        # ---- vllm_main per-stage NVTX (gated by VLLM_PP_STAGE_NVTX=1) ----
++        import os as _os_ssnv
++        _ssnv = _os_ssnv.environ.get("VLLM_PP_STAGE_NVTX", "0") == "1"
++        _ssnv_push = (
++            torch.cuda.nvtx.range_push if _ssnv else (lambda _x: None)
++        )
++        _ssnv_pop = (
++            torch.cuda.nvtx.range_pop if _ssnv else (lambda: None)
++        )
++        # ---- end vllm_main ----
+         if self.execute_model_state is not None:
+             raise RuntimeError(
+                 "State error: sample_tokens() must be called "
+@@ -3989,12 +4081,15 @@
+             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+ 
+         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
++        _ssnv_push("stage_preprocess")
+         with (
+             record_function_or_nullcontext("gpu_model_runner: preprocess"),
+             self.synchronize_input_prep(),
+         ):
+             # Update persistent batch states.
++            _ssnv_push("stage_update_states")
+             deferred_state_corrections_fn = self._update_states(scheduler_output)
++            _ssnv_pop()
+ 
+             if has_ec_transfer() and not get_ec_transfer().is_consumer:
+                 with self.maybe_get_ec_connector_output(
+@@ -4036,10 +4131,12 @@
+             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+ 
++            _ssnv_push("stage_prep_inputs")
+             logits_indices, spec_decode_metadata = self._prepare_inputs(
+                 scheduler_output,
+                 num_scheduled_tokens_np,
+             )
++            _ssnv_pop()
+ 
+             cascade_attn_prefix_lens = None
+             # Disable cascade attention when using microbatching (DBO)
+@@ -4228,6 +4325,8 @@
+                 defer_finalize=defer_kv_connector_finalize,
+             ) as kv_connector_output,
+         ):
++            _ssnv_pop()  # end stage_preprocess
++            _ssnv_push("stage_forward")
+             model_output = self._model_forward(
+                 input_ids=input_ids,
+                 positions=positions,
+@@ -4235,7 +4334,9 @@
+                 inputs_embeds=inputs_embeds,
+                 **model_kwargs,
+             )
++            _ssnv_pop()  # end stage_forward
+ 
++        _ssnv_push("stage_postprocess")
+         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+             if self.use_aux_hidden_state_outputs:
+                 # True when EAGLE 3 is used.
+@@ -4252,6 +4353,7 @@
+                     assert isinstance(hidden_states, IntermediateTensors)
+                     hidden_states.kv_connector_output = kv_connector_output
+                     self.kv_connector_output = kv_connector_output
++                    _ssnv_pop()  # end stage_postprocess (rank 0 early return)
+                     return hidden_states
+ 
+                 if self.is_pooling_model:
+@@ -4314,18 +4416,31 @@
+         if deferred_state_corrections_fn:
+             deferred_state_corrections_fn()
+ 
++        _ssnv_pop()  # end stage_postprocess
+         return None
+ 
+     @torch.inference_mode
+     def sample_tokens(
+         self, grammar_output: "GrammarOutput | None"
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
++        # ---- vllm_main per-stage NVTX (gated by VLLM_PP_STAGE_NVTX=1) ----
++        import os as _os_ssnv2
++        _ssnv = _os_ssnv2.environ.get("VLLM_PP_STAGE_NVTX", "0") == "1"
++        _ssnv_push = (
++            torch.cuda.nvtx.range_push if _ssnv else (lambda _x: None)
++        )
++        _ssnv_pop = (
++            torch.cuda.nvtx.range_pop if _ssnv else (lambda: None)
++        )
++        # ---- end vllm_main ----
+         if self.execute_model_state is None:
++            _ssnv_push("stage_pp_bcast_recv")
+             kv_connector_output = self.kv_connector_output
+             self.kv_connector_output = None
+             # receive sampled token ids from the last PP rank.
+             if self.use_async_scheduling and not get_pp_group().is_last_rank:
+                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
++            _ssnv_pop()
+             if not kv_connector_output:
+                 return None  # type: ignore[return-value]
+ 
+@@ -4360,21 +4475,27 @@
+                 scheduler_output, grammar_output, self.input_batch, logits
+             )
+ 
++        _ssnv_push("stage_sample")
+         with record_function_or_nullcontext("gpu_model_runner: sample"):
+             sampler_output = self._sample(logits, spec_decode_metadata)
++        _ssnv_pop()
+ 
++        _ssnv_push("stage_update_states_after_exec")
+         self._update_states_after_model_execute(
+             sampler_output.sampled_token_ids, scheduler_output
+         )
++        _ssnv_pop()
+         if self.use_async_scheduling:
+             pp = get_pp_group()
+             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
+             # PP outputs have been broadcasted to all ranks at logits computation.
+             # Therefore, here is no need to send sampled token ids again in this case.
+             if not self.broadcast_pp_output and pp.world_size > 1 and pp.is_last_rank:
++                _ssnv_push("stage_pp_bcast_send")
+                 self._pp_broadcast_prev_sampled_token_ids(
+                     sampler_output.sampled_token_ids
+                 )
++                _ssnv_pop()
+ 
+         self._draft_token_ids = None
+         self._draft_probs = None
+@@ -4477,6 +4598,7 @@
+                 self._draft_prob_req_ids = None
+                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
+ 
++        _ssnv_push("stage_bookkeep")
+         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+             (
+                 num_nans_in_logits,
+@@ -4493,6 +4615,7 @@
+                 hidden_states,
+                 scheduler_output.total_num_scheduled_tokens,
+             )
++        _ssnv_pop()  # end stage_bookkeep
+ 
+         if propose_drafts_after_bookkeeping:
+             # ngram and other speculative decoding methods use the sampled
+@@ -4566,6 +4689,7 @@
+                     ].clone(),
+                 )
+ 
++            _ssnv_push("stage_async_output_create")
+             async_output = AsyncGPUModelRunnerOutput(
+                 model_runner_output=output,
+                 sampled_token_ids=sampler_output.sampled_token_ids,
+@@ -4575,6 +4699,7 @@
+                 vocab_size=self.input_batch.vocab_size,
+                 routed_experts=routed_experts_snapshot,
+             )
++            _ssnv_pop()
+         with record_function_or_nullcontext(
+             "gpu_model_runner: set_async_sampled_token_ids"
+         ):
+@@ -4600,9 +4725,26 @@
+         # Skip for chunked prefill: sampled tokens are dummy
+         # and will be discarded, no need to broadcast.
+         if not self._is_all_reqs_chunked_prefill():
+-            torch.distributed.broadcast(
+-                sampled_token_ids, src=pp.rank, group=pp.device_group
+-            )
++            # ---- vllm_main: broadcast on side stream so default
++            # stream is not blocked while NCCL spins waiting for the
++            # other PP rank. record_stream keeps the tensor alive past
++            # default_stream's view of its lifetime.
++            if self._pp_sampled_bcast_on_side:
++                side = self._pp_sampled_bcast_side_stream
++                assert side is not None
++                side.wait_stream(torch.cuda.current_stream())
++                with torch.cuda.stream(side):
++                    sampled_token_ids.record_stream(side)
++                    torch.distributed.broadcast(
++                        sampled_token_ids, src=pp.rank, group=pp.device_group
++                    )
++                    assert self._pp_sampled_bcast_event is not None
++                    self._pp_sampled_bcast_event.record(side)
++            else:
++                torch.distributed.broadcast(
++                    sampled_token_ids, src=pp.rank, group=pp.device_group
++                )
++            # ---- end vllm_main ----
+ 
+     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
+         """Receive sampled token ids broadcast from last PP stage"""
+@@ -4613,7 +4755,24 @@
+         recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
+         # skip for chunked prefill.
+         if not self._is_all_reqs_chunked_prefill():
+-            torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
++            # ---- vllm_main: see _pp_broadcast_prev_sampled_token_ids
++            # for the rationale. On the recv side, the side-stream broadcast
++            # is what actually unblocks rank 0's default_stream from spinning
++            # for ~26ms per mb.
++            if self._pp_sampled_bcast_on_side:
++                side = self._pp_sampled_bcast_side_stream
++                assert side is not None
++                side.wait_stream(torch.cuda.current_stream())
++                with torch.cuda.stream(side):
++                    recv.record_stream(side)
++                    torch.distributed.broadcast(
++                        recv, src=pp.last_rank, group=pp.device_group
++                    )
++                    assert self._pp_sampled_bcast_event is not None
++                    self._pp_sampled_bcast_event.record(side)
++            else:
++                torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
++            # ---- end vllm_main ----
+         self.input_batch.prev_sampled_token_ids = recv
+ 
+         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
+diff -ruN -x '*.so' -x __pycache__ -x '*.pyc' -x '*.pyi' a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+--- a/vllm/v1/worker/gpu_worker.py	2026-06-23 08:48:18.274444649 +0000
++++ b/vllm/v1/worker/gpu_worker.py	2026-06-06 16:02:24.562589457 +0000
+@@ -91,6 +91,12 @@
+     def wait_for_comm(self) -> None:
+         if self._comm_waited:
+             return
++        # NVTX: surface recv-wait latency (handle.wait is stream-based for
++        # NCCL backend; this still includes any CPU-side fence + scheduling).
++        import os as _os
++        _nvtx_on = _os.environ.get("VLLM_PP_NVTX", "0") == "1"
++        if _nvtx_on:
++            torch.cuda.nvtx.range_push("recv_wait")
+         if self._comm_handles:
+             for handle in self._comm_handles:
+                 handle.wait()
+@@ -98,6 +104,8 @@
+             for fn in self._comm_postprocess:
+                 fn()
+         self._comm_waited = True
++        if _nvtx_on:
++            torch.cuda.nvtx.range_pop()
+ 
+     def __getattribute__(self, name: str):
+         # ensure `.tensors` is ready before use
+@@ -154,6 +162,79 @@
+         # pending non-blocking PP send work from the previous iteration
+         self._pp_send_work: list[Handle] = []
+ 
++        # ---- vllm_main PP overlap ring buffer ----
++        # CUDA graph reuses a fixed output buffer for intermediate_tensors;
++        # replay(K+1) overwrites it before NCCL finishes reading for isend(K),
++        # which forces a stream sync and serializes pipeline stages. With a
++        # ring of N pre-allocated send buffers we copy the post-replay view
++        # into ring[K % N] and isend from that slot, so the next replay's
++        # write to the graph's fixed buffer no longer races the in-flight send.
++        # We only block (handle.wait()) at ring wrap-around (slot reuse).
++        self._pp_send_ring_size = int(
++            os.environ.get("VLLM_PP_SEND_RING_SIZE", "0")
++        )
++        self._pp_send_ring: list[IntermediateTensors] | None = None
++        self._pp_send_ring_handles: list[list[Handle]] = []
++        self._pp_send_step: int = 0
++
++        # ---- vllm_main PP recv-side pre-issue ----
++        # See VLLM_PP_RECV_PREISSUE block (kept for A/B vs no-cache). The
++        # naive pre-issue does NOT help by itself because recv_object still
++        # blocks at the new location.
++        self._pp_recv_preissue = (
++            os.environ.get("VLLM_PP_RECV_PREISSUE", "0") == "1"
++        )
++        self._pp_pending_recv: tuple | None = None
++
++        # ---- vllm_main PP metadata-cache (skip recv_object after
++        # first mb) ----
++        # Older variant (VLLM_PP_SKIP_METADATA=1): caches metadata after
++        # first call, but deadlocks on shape change (prefill→decode). Kept
++        # for A/B comparison; superseded by FastPPComm below.
++        self._pp_skip_metadata = (
++            os.environ.get("VLLM_PP_SKIP_METADATA", "0") == "1"
++        )
++        self._pp_cached_metadata: list[tuple[str, Any]] | None = None
++
++        # ---- vllm_main PP background-thread irecv (Phase 6) ----
++        # When VLLM_PP_BG_IRECV=1, a daemon thread on the worker process
++        # pre-issues the NEXT mb's irecv (signature recv + tensor irecv
++        # submission) while the main thread is still in the current mb's
++        # model_runner_exec. Main thread pops the pre-issued handles at
++        # the start of the next execute_model. Requires VLLM_PP_FAST_COMM=1.
++        self._pp_bg_irecv = (
++            os.environ.get("VLLM_PP_BG_IRECV", "0") == "1"
++        )
++        self._pp_bg_thread = None
++        self._pp_bg_request_event = None  # threading.Event
++        self._pp_bg_result_queue = None   # queue.Queue(maxsize=1)
++        self._pp_bg_shutdown_event = None
++
++        # ---- vllm_main PP FastPPComm (Phase 2+) ----
++        # New design: per-mb 4-byte shape signature over gloo (instead of
++        # pickled TensorMetadata, ~500 bytes). Receiver allocates from
++        # (signaled_num_tokens, cached_hidden_dims) and calls
++        # torch.distributed.irecv directly. Sender skips send_object and
++        # calls torch.distributed.isend directly. First mb falls back to
++        # full irecv/isend_tensor_dict and caches dtype/device/hidden_dims.
++        # Shape-change is handled correctly because we signal num_tokens
++        # per mb (not assume constant) and only cache the per-tensor
++        # NON-batch dims (dtype/device/hidden).
++        self._pp_fast_comm = (
++            os.environ.get("VLLM_PP_FAST_COMM", "0") == "1"
++        )
++        # cached spec: dict[key] = {"dtype": dt, "device": dev, "hidden_dims": tuple}
++        self._pp_fast_spec: dict[str, dict] | None = None
++        # cached IntermediateTensors key order (so we preserve send/recv order)
++        self._pp_fast_keys: list[str] | None = None
++        self._pp_fast_first_call_done = False
++        # 4-byte recv buffer for signal — pre-allocate to avoid per-mb alloc
++        self._pp_fast_sig_recv = None  # lazy-init to torch.empty(1, int32, cpu)
++        # counters for debug
++        self._pp_fast_count = 0
++        self._pp_fast_fallback_count = 0
++        # ---- end vllm_main patches ----
++
+     def sleep(self, level: int = 1) -> None:
+         from vllm.device_allocator.cumem import CuMemAllocator
+ 
+@@ -595,19 +676,60 @@
+                 if not any(x in compile_range for x in all_sizes):
+                     warmup_sizes.append(compile_range.end)
+ 
++        # ---- vllm_main diag ----
++        import os as _diag_os2, time as _diag_time2, sys as _diag_sys2, socket as _diag_sock2
++        _diag2_on = _diag_os2.environ.get("VLLM_DIAG_HANG", "0") == "1"
++        _diag2_f = None
++        if _diag2_on:
++            _diag2_os_dir = "/tmp/vllm_diag"
++            _diag_os2.makedirs(_diag2_os_dir, exist_ok=True)
++            try:
++                from vllm.distributed.parallel_state import get_pp_group as _gpp2_init
++                _pp_r_init = _gpp2_init().rank_in_group
++                _tp_r_init = -1
++                try:
++                    from vllm.distributed.parallel_state import get_tp_group as _gtp2_init
++                    _tp_r_init = _gtp2_init().rank_in_group
++                except Exception:
++                    pass
++            except Exception:
++                _pp_r_init = -1
++                _tp_r_init = -1
++            _diag2_path = f"{_diag2_os_dir}/compile_warmup_{_diag_sock2.gethostname()}_pp{_pp_r_init}_tp{_tp_r_init}_pid{_diag_os2.getpid()}.log"
++            _diag2_f = open(_diag2_path, "w", buffering=1)
++        def _diag2(stage: str):
++            if _diag2_on:
++                try:
++                    from vllm.distributed.parallel_state import get_pp_group as _gpp2
++                    _r = _gpp2().rank_in_group
++                except Exception:
++                    _r = -1
++                msg = f"[diag2 t={_diag_time2.time():.3f} pp{_r} pid={_diag_os2.getpid()}] compile_or_warm_up_model: {stage}\n"
++                if _diag2_f is not None:
++                    _diag2_f.write(msg)
++                _diag_sys2.stderr.write(msg)
++                _diag_sys2.stderr.flush()
++        _diag2("entered")
++        # ---- end vllm_main diag ----
++
+         # We skip EPLB here since we don't want to record dummy metrics
+         for size in sorted(warmup_sizes, reverse=True):
+             logger.info("Compile and warming up model for size %d", size)
+             self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
++        _diag2("after warmup_sizes _dummy_run loop")
+         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
++        _diag2("after maybe_remove_all_loras")
+ 
+         # Warmup and tune the kernels used during model execution before
+         # cuda graph capture.
+         kernel_warmup(self)
++        _diag2("after kernel_warmup")
+ 
+         cuda_graph_memory_bytes = 0
+         if not self.model_config.enforce_eager:
++            _diag2("before capture_model")
+             cuda_graph_memory_bytes = self.model_runner.capture_model()
++            _diag2("after capture_model")
+ 
+         # Compare actual vs estimated CUDA graph memory (if we did profiling)
+         if (
+@@ -682,10 +804,14 @@
+ 
+             logger.debug(msg)
+ 
++        _diag2("after capture_model branch (after bookkeeping)")
+         if self.use_v2_model_runner:
++            _diag2("before warmup_kernels (V2)")
+             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
+             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
++            _diag2("after warmup_kernels (V2)")
+         elif get_pp_group().is_last_rank:
++            _diag2("before V1 last_rank sampler warmup")
+             # V1: Warm up sampler and preallocate memory buffer for logits and other
+             # sampling related tensors of max possible shape to avoid memory
+             # fragmentation issue.
+@@ -706,10 +832,14 @@
+                 self.model_runner._dummy_pooler_run(hidden_states)
+             else:
+                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
++            _diag2("after V1 last_rank sampler warmup")
++        else:
++            _diag2("skipped V1 last_rank branch (not last_rank)")
+ 
+         # Reset the seed to ensure that the random state is not affected by
+         # the model initialization and profiling.
+         set_random_seed(self.model_config.seed)
++        _diag2("after set_random_seed")
+ 
+         # All warmup is done — start monitoring for unexpected JIT
+         # compilations that would cause latency spikes during inference.
+@@ -718,6 +848,7 @@
+         )
+ 
+         activate_triton_jit_monitor()
++        _diag2("after activate_triton_jit_monitor — RETURNING")
+ 
+         return CompilationTimes(
+             language_model=self.compilation_config.compilation_time,
+@@ -771,21 +902,320 @@
+         )
+         return self.profiler.annotate_context_manager(annotation)
+ 
++    # ---- vllm_main: metadata-cache helpers ----
++    def _cache_metadata_from_irecv(self, tensor_dict: dict[str, torch.Tensor]) -> None:
++        """Cache (key, size, dtype, device) from a first irecv_tensor_dict call.
++
++        Stored in `self._pp_cached_metadata` so subsequent mbs can skip the
++        recv_object metadata sync. Must be invalidated if shape changes.
++        """
++        if not isinstance(tensor_dict, dict):
++            return
++        cached = []
++        for k, v in tensor_dict.items():
++            if isinstance(v, torch.Tensor):
++                cached.append((k, tuple(v.shape), v.dtype, v.device))
++            else:
++                cached.append((k, None, None, None))  # passthrough
++        self._pp_cached_metadata = cached
++
++    def _irecv_cached(self, all_gather_tensors: dict[str, bool]):
++        """Fast-path irecv using cached metadata + fresh buffers.
++
++        Bypasses `recv_object()` and the all-gather optimization (always
++        transfers the full tensor). The all-gather slicing path was tried
++        but the cached metadata couldn't disambiguate full-vs-slice shape
++        cleanly across ranks; keeping the slow-but-correct full transfer.
++        """
++        pp = get_pp_group()
++        src = (pp.rank_in_group - 1) % pp.world_size
++        src_global = pp.ranks[src]
++        tensor_dict: dict[str, Any] = {}
++        handles: list = []
++        for k, shape, dtype, device in self._pp_cached_metadata:
++            if shape is None:
++                continue
++            t = torch.empty(shape, dtype=dtype, device=device)
++            handle = torch.distributed.irecv(
++                t, src=src_global, group=pp.device_group
++            )
++            handles.append(handle)
++            tensor_dict[k] = t
++        return tensor_dict, handles, []
++
++    def _isend_cached(
++        self, tensor_dict: dict[str, torch.Tensor],
++        all_gather_tensors: dict[str, bool],
++    ):
++        """Fast-path isend bypassing send_object. Symmetric to _irecv_cached:
++        always transfers full tensors (no all-gather slicing)."""
++        pp = get_pp_group()
++        dst = (pp.rank_in_group + 1) % pp.world_size
++        dst_global = pp.ranks[dst]
++        handles: list = []
++        for k, v in tensor_dict.items():
++            if not isinstance(v, torch.Tensor) or v.numel() == 0:
++                continue
++            handle = torch.distributed.isend(
++                v, dst=dst_global, group=pp.device_group
++            )
++            if v.is_cuda:
++                v.record_stream(torch.cuda.current_stream(v.device))
++            handles.append(handle)
++        return handles
++
++    # ---- vllm_main FastPPComm helpers (Phase 2) ----
++    def _fast_pp_record_first_call(self, tensor_dict: dict[str, torch.Tensor]) -> None:
++        """After the first irecv_tensor_dict (or first output we sent),
++        cache per-key (dtype, device, hidden_dims) so subsequent mbs can
++        skip metadata sync. hidden_dims = shape[1:]."""
++        spec: dict[str, dict] = {}
++        keys: list[str] = []
++        for k, v in tensor_dict.items():
++            if isinstance(v, torch.Tensor):
++                spec[k] = {
++                    "dtype": v.dtype,
++                    "device": v.device,
++                    "hidden_dims": tuple(v.shape[1:]),
++                }
++                keys.append(k)
++        self._pp_fast_spec = spec
++        self._pp_fast_keys = keys
++        self._pp_fast_first_call_done = True
++
++    def _fast_pp_isend(
++        self,
++        tensor_dict: dict[str, torch.Tensor],
++        all_gather_tensors: dict[str, bool],
++        fallback_isend_fn,
++    ):
++        """Send a small 4-byte num_tokens signature on gloo cpu_group,
++        then NCCL isend each tensor on the device group.
++
++        First call: delegates to fallback_isend_fn (full metadata sync) and
++        records spec. Returns list of handles from the NCCL isends.
++        """
++        pp = get_pp_group()
++        if not self._pp_fast_first_call_done:
++            # First call: keep all-gather disabled so cached spec matches
++            # the actual NCCL transfer on subsequent fast-path calls.
++            handles = fallback_isend_fn(
++                tensor_dict,
++                all_gather_group=None,
++                all_gather_tensors=all_gather_tensors,
++            )
++            self._fast_pp_record_first_call(tensor_dict)
++            self._pp_fast_fallback_count += 1
++            return handles
++
++        # Fast path: send 4-byte signature, then NCCL isend each tensor.
++        # All tensors share the same first-dim (num_tokens). Pick the first
++        # cached key's tensor to extract it.
++        first_key = self._pp_fast_keys[0]
++        first_tensor = tensor_dict[first_key]
++        n_tokens = int(first_tensor.shape[0])
++
++        # Send signature on gloo cpu_group (4-byte int32).
++        dst = (pp.rank_in_group + 1) % pp.world_size
++        dst_global = pp.ranks[dst]
++        sig = torch.tensor([n_tokens], dtype=torch.int32, device="cpu")
++        torch.distributed.send(sig, dst=dst_global, group=pp.cpu_group)
++
++        # NCCL isend each cached-key tensor (full tensor, no all-gather).
++        handles: list = []
++        for k in self._pp_fast_keys:
++            v = tensor_dict.get(k)
++            if v is None or not isinstance(v, torch.Tensor) or v.numel() == 0:
++                continue
++            handle = torch.distributed.isend(
++                v, dst=dst_global, group=pp.device_group
++            )
++            if v.is_cuda:
++                v.record_stream(torch.cuda.current_stream(v.device))
++            handles.append(handle)
++        self._pp_fast_count += 1
++        return handles
++
++    def _fast_pp_irecv(
++        self,
++        all_gather_tensors: dict[str, bool],
++        fallback_irecv_fn,
++    ):
++        """Receive a 4-byte num_tokens signature on gloo, allocate fresh
++        tensors from cached spec, then NCCL irecv. Returns
++        (tensor_dict, handles, postprocess) shaped like irecv_tensor_dict.
++
++        First call: delegates to fallback_irecv_fn (full metadata sync)
++        and records spec.
++        """
++        pp = get_pp_group()
++        if not self._pp_fast_first_call_done:
++            tensor_dict, handles, postprocess = fallback_irecv_fn(
++                all_gather_group=None,  # full tensor, no all-gather slice
++                all_gather_tensors=all_gather_tensors,
++            )
++            self._fast_pp_record_first_call(tensor_dict)
++            self._pp_fast_fallback_count += 1
++            return tensor_dict, handles, postprocess
++
++        src = (pp.rank_in_group - 1) % pp.world_size
++        src_global = pp.ranks[src]
++
++        # Recv signature first (4 bytes on gloo).
++        if self._pp_fast_sig_recv is None:
++            self._pp_fast_sig_recv = torch.empty(1, dtype=torch.int32, device="cpu")
++        torch.distributed.recv(
++            self._pp_fast_sig_recv, src=src_global, group=pp.cpu_group
++        )
++        n_tokens = int(self._pp_fast_sig_recv.item())
++
++        # Allocate fresh tensors from cached spec.
++        tensor_dict: dict[str, Any] = {}
++        handles: list = []
++        for k in self._pp_fast_keys:
++            spec = self._pp_fast_spec[k]
++            t = torch.empty(
++                (n_tokens,) + spec["hidden_dims"],
++                dtype=spec["dtype"],
++                device=spec["device"],
++            )
++            handle = torch.distributed.irecv(
++                t, src=src_global, group=pp.device_group
++            )
++            handles.append(handle)
++            tensor_dict[k] = t
++        self._pp_fast_count += 1
++        return tensor_dict, handles, []
++    # ---- end FastPPComm helpers ----
++
++    # ---- vllm_main BG irecv thread helpers (Phase 6) ----
++    def _bg_irecv_ensure_started(self):
++        """Lazy-start the background irecv thread on first use."""
++        if self._pp_bg_thread is not None:
++            return
++        import threading
++        import queue as _queue
++        self._pp_bg_request_event = threading.Event()
++        self._pp_bg_shutdown_event = threading.Event()
++        self._pp_bg_result_queue = _queue.Queue(maxsize=1)
++        self._pp_bg_thread = threading.Thread(
++            target=self._bg_irecv_loop, daemon=True,
++            name="WorkerBgIrecv",
++        )
++        self._pp_bg_thread.start()
++
++    def _bg_irecv_loop(self):
++        """Daemon-thread loop. Waits for a request signal, then issues one
++        FastPPComm irecv (signature recv + NCCL irecv submission) and pushes
++        the result onto the queue.
++
++        The signature recv (gloo) blocks the bg thread (not main thread).
++        The NCCL irecv is async, so it returns immediately.
++        """
++        from vllm.platforms import current_platform
++        if hasattr(self, "device"):
++            current_platform.set_device(self.device)
++        while not self._pp_bg_shutdown_event.is_set():
++            # Wait up to 100ms for a request, then check shutdown.
++            triggered = self._pp_bg_request_event.wait(timeout=0.1)
++            if self._pp_bg_shutdown_event.is_set():
++                break
++            if not triggered:
++                continue
++            self._pp_bg_request_event.clear()
++            try:
++                result = self._fast_pp_irecv(
++                    all_gather_tensors={},
++                    fallback_irecv_fn=get_pp_group().irecv_tensor_dict,
++                )
++                self._pp_bg_result_queue.put(result)
++            except Exception as e:
++                # Push exception so main thread can re-raise
++                self._pp_bg_result_queue.put(e)
++
++    def _bg_irecv_pop(self, timeout: float = 5.0):
++        """Get the next pre-issued irecv result. Returns None if not available."""
++        if self._pp_bg_result_queue is None:
++            return None
++        try:
++            result = self._pp_bg_result_queue.get(timeout=timeout)
++        except Exception:
++            return None
++        if isinstance(result, Exception):
++            raise result
++        return result
++
++    def _bg_irecv_kick(self):
++        """Signal bg thread to pre-issue the next irecv."""
++        if self._pp_bg_request_event is not None:
++            self._pp_bg_request_event.set()
++    # ---- end BG irecv helpers ----
++
+     @torch.inference_mode()
+     def sample_tokens(
+         self, grammar_output: "GrammarOutput | None"
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+-        return self.model_runner.sample_tokens(grammar_output)
++        import os as _os
++        _nvtx_on = _os.environ.get("VLLM_PP_NVTX", "0") == "1"
++        if _nvtx_on:
++            try:
++                from vllm.distributed.parallel_state import get_pp_group as _gpp
++                _pp = _gpp().rank_in_group
++                _is_last = _gpp().is_last_rank
++            except Exception:
++                _pp = -1
++                _is_last = False
++            _seq = getattr(self, "_sample_seq", 0) + 1
++            self._sample_seq = _seq
++            label = "sample_last" if _is_last else "sample_nonlast_recv"
++            torch.cuda.nvtx.range_push(f"{label} pp={_pp} mb={_seq}")
++        try:
++            return self.model_runner.sample_tokens(grammar_output)
++        finally:
++            if _nvtx_on:
++                torch.cuda.nvtx.range_pop()
+ 
+     @torch.inference_mode()
+     def execute_model(
+         self, scheduler_output: "SchedulerOutput"
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+-        # ensure any previous non-blocking PP sends are complete
+-        if self._pp_send_work:
++        # ---- vllm_main PP overlap patch ----
++        import os as _os, time as _t
++        _mb_overlap = _os.environ.get("VLLM_PP_OVERLAP", "0") == "1"
++        _trace = _os.environ.get("VLLM_PP_TRACE", "0") == "1"
++        _shape_debug = _os.environ.get("VLLM_PP_SHAPE_DEBUG", "0") == "1"
++        _nvtx_on = _os.environ.get("VLLM_PP_NVTX", "0") == "1"
++        # cache pp_rank once (don't keep recomputing it)
++        if not hasattr(self, "_pp_nvtx_rank"):
++            try:
++                from vllm.distributed.parallel_state import get_pp_group as _gpp
++                self._pp_nvtx_rank = _gpp().rank_in_group
++                self._pp_nvtx_world = _gpp().world_size
++            except Exception:
++                self._pp_nvtx_rank = -1
++                self._pp_nvtx_world = -1
++        # monotonic mb seq for matching ranges across ranks in nsight
++        self._mb_seq = getattr(self, "_mb_seq", 0) + 1
++        _pp = self._pp_nvtx_rank
++        _seq = self._mb_seq
++        _nvtx_push = torch.cuda.nvtx.range_push if _nvtx_on else (lambda _x: None)
++        _nvtx_pop = torch.cuda.nvtx.range_pop if _nvtx_on else (lambda: None)
++
++        _nvtx_push(f"exec_model pp={_pp} mb={_seq}")
++        if _trace:
++            self._mb_entry_t = _t.perf_counter()
++            self._mb_pp_rank = _pp
++            print(
++                f"[trace pp{_pp}] enter execute_model t={self._mb_entry_t*1000:.1f}ms seq={_seq}",
++                flush=True,
++            )
++        if self._pp_send_work and not _mb_overlap:
++            _nvtx_push(f"prev_send_wait pp={_pp} mb={_seq}")
+             for handle in self._pp_send_work:
+                 handle.wait()
+             self._pp_send_work = []
++            _nvtx_pop()
++        # ---- end vllm_main patch ----
+ 
+         intermediate_tensors = None
+         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+@@ -794,6 +1224,32 @@
+         compilation_config = self.vllm_config.compilation_config
+         parallel_config = self.vllm_config.parallel_config
+ 
++        # Phase 1a shape-predictability instrumentation. Logs the
++        # scheduler_output info on both ranks; we'll diff after the run
++        # to verify rank 0 and rank 1 always agree on num_scheduled_tokens
++        # for the SAME mb_seq (modulo a small PP pipeline offset).
++        if _shape_debug and forward_pass:
++            try:
++                num_reqs_here = len(scheduler_output.num_scheduled_tokens)
++                # sorted req ids → deterministic comparison across ranks
++                req_ids_sorted = sorted(scheduler_output.num_scheduled_tokens.keys())
++                req_id_first = req_ids_sorted[0] if req_ids_sorted else "?"
++                req_tokens_first = (
++                    scheduler_output.num_scheduled_tokens[req_id_first]
++                    if req_ids_sorted else 0
++                )
++                import sys as _sys
++                print(
++                    f"[shape pp{_pp} mb={_seq}] "
++                    f"num_scheduled_tokens={num_scheduled_tokens} "
++                    f"num_reqs={num_reqs_here} "
++                    f"req0_id={req_id_first} "
++                    f"req0_tokens={req_tokens_first}",
++                    file=_sys.stderr, flush=True,
++                )
++            except Exception as _e:
++                print(f"[shape pp{_pp} mb={_seq}] err={_e}", flush=True)
++
+         if (
+             parallel_config.pipeline_parallel_size > 1
+             and compilation_config.pass_config.enable_sp
+@@ -824,19 +1280,88 @@
+             }
+ 
+         if forward_pass and not get_pp_group().is_first_rank:
+-            tensor_dict, comm_handles, comm_postprocess = (
+-                get_pp_group().irecv_tensor_dict(
+-                    all_gather_group=get_tp_group(),
+-                    all_gather_tensors=all_gather_tensors,
++            _nvtx_push(f"irecv_issue pp={_pp} mb={_seq}")
++            if self._pp_pending_recv is not None:
++                tensor_dict, comm_handles, comm_postprocess = self._pp_pending_recv
++                self._pp_pending_recv = None
++            elif self._pp_bg_irecv and self._pp_fast_comm:
++                # Background-thread irecv: pop only if bg thread has been
++                # kicked at least once (i.e. first call already happened).
++                # First call always uses inline FastPPComm.
++                self._bg_irecv_ensure_started()
++                if self._pp_fast_first_call_done:
++                    bg_result = self._bg_irecv_pop(timeout=2.0)
++                    if bg_result is not None:
++                        tensor_dict, comm_handles, comm_postprocess = bg_result
++                    else:
++                        # bg thread didn't produce in time; inline fallback
++                        tensor_dict, comm_handles, comm_postprocess = (
++                            self._fast_pp_irecv(
++                                all_gather_tensors,
++                                fallback_irecv_fn=get_pp_group().irecv_tensor_dict,
++                            )
++                        )
++                else:
++                    # First call: bg thread cannot be used (no spec cached yet)
++                    tensor_dict, comm_handles, comm_postprocess = (
++                        self._fast_pp_irecv(
++                            all_gather_tensors,
++                            fallback_irecv_fn=get_pp_group().irecv_tensor_dict,
++                        )
++                    )
++            elif self._pp_fast_comm:
++                # FastPPComm path: 4-byte signature recv + direct NCCL irecv
++                tensor_dict, comm_handles, comm_postprocess = (
++                    self._fast_pp_irecv(
++                        all_gather_tensors,
++                        fallback_irecv_fn=get_pp_group().irecv_tensor_dict,
++                    )
+                 )
+-            )
++            elif self._pp_skip_metadata and self._pp_cached_metadata is not None:
++                tensor_dict, comm_handles, comm_postprocess = (
++                    self._irecv_cached(all_gather_tensors)
++                )
++            else:
++                # When SKIP_METADATA is enabled and this is the first call,
++                # disable the all-gather optimization (pass None) so the
++                # cached shape on subsequent mbs matches the actual NCCL
++                # transfer (full tensor, not TP-sliced).
++                first_call_ag_group = (
++                    None if self._pp_skip_metadata else get_tp_group()
++                )
++                tensor_dict, comm_handles, comm_postprocess = (
++                    get_pp_group().irecv_tensor_dict(
++                        all_gather_group=first_call_ag_group,
++                        all_gather_tensors=all_gather_tensors,
++                    )
++                )
++                if self._pp_skip_metadata and self._pp_cached_metadata is None:
++                    self._cache_metadata_from_irecv(tensor_dict)
+             assert tensor_dict is not None
+             intermediate_tensors = AsyncIntermediateTensors(
+                 tensor_dict,
+                 comm_handles=comm_handles,
+                 comm_postprocess=comm_postprocess,
+             )
++            # Kick the background thread to start pre-issuing the NEXT
++            # mb's irecv (signature wait + NCCL irecv submit) NOW, while
++            # the main thread will go off and do model_runner_exec.
++            if self._pp_bg_irecv and self._pp_fast_comm:
++                self._bg_irecv_kick()
++            if _shape_debug:
++                import sys as _sys
++                shapes = {
++                    k: (tuple(v.shape), str(v.dtype))
++                    for k, v in tensor_dict.items()
++                    if hasattr(v, "shape")
++                }
++                print(
++                    f"[shape_recv pp{_pp} mb={_seq}] {shapes}",
++                    file=_sys.stderr, flush=True,
++                )
++            _nvtx_pop()
+ 
++        _nvtx_push(f"model_runner_exec pp={_pp} mb={_seq}")
+         with self.annotate_profile(scheduler_output):
+             output = self.model_runner.execute_model(
+                 scheduler_output, intermediate_tensors
+@@ -850,21 +1375,166 @@
+             if isinstance(
+                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
+             ):
++                _nvtx_pop()  # model_runner_exec
++                _nvtx_pop()  # exec_model
+                 return output
++        _nvtx_pop()  # model_runner_exec
+ 
+         assert isinstance(output, IntermediateTensors)
++        if _shape_debug:
++            import sys as _sys
++            shapes = {
++                k: (tuple(v.shape), str(v.dtype))
++                for k, v in output.tensors.items()
++                if hasattr(v, "shape")
++            }
++            print(
++                f"[shape_send pp{_pp} mb={_seq}] {shapes}",
++                file=_sys.stderr, flush=True,
++            )
+         parallel_config = self.vllm_config.parallel_config
+         assert (
+             parallel_config.distributed_executor_backend != "external_launcher"
+             and not get_pp_group().is_last_rank
+         )
+ 
+-        # launch non-blocking send of intermediate tensors
+-        self._pp_send_work = get_pp_group().isend_tensor_dict(
+-            output.tensors,
+-            all_gather_group=get_tp_group(),
+-            all_gather_tensors=all_gather_tensors,
+-        )
++        # ---- vllm_main PP overlap patch (ring buffer) ----
++        # When VLLM_PP_SEND_RING_SIZE > 0 and overlap is enabled, route the
++        # send through a ring of N decoupled buffers so the next replay's
++        # write to the graph-captured output buffer no longer races the
++        # in-flight NCCL send. We block only at ring slot wrap-around.
++        _ring_n = self._pp_send_ring_size
++        if _ring_n > 0 and _mb_overlap:
++            if self._pp_send_ring is None:
++                # Lazy alloc: allocate max-sized slots so any batch fits.
++                max_n = max(
++                    self.scheduler_config.max_num_batched_tokens,
++                    *(v.shape[0] for v in output.tensors.values()),
++                )
++                self._pp_send_ring = [
++                    IntermediateTensors(
++                        {
++                            k: torch.empty(
++                                (max_n,) + tuple(v.shape[1:]),
++                                dtype=v.dtype,
++                                device=v.device,
++                            )
++                            for k, v in output.tensors.items()
++                        }
++                    )
++                    for _ in range(_ring_n)
++                ]
++                self._pp_send_ring_handles = [[] for _ in range(_ring_n)]
++
++            ring_idx = self._pp_send_step % _ring_n
++            # Wait only when this slot's previous NCCL send is still in flight.
++            # First _ring_n steps have empty handles list -> no wait.
++            _nvtx_push(f"ring_slot_wait pp={_pp} mb={_seq} slot={ring_idx}")
++            for handle in self._pp_send_ring_handles[ring_idx]:
++                handle.wait()
++            self._pp_send_ring_handles[ring_idx] = []
++            _nvtx_pop()
++
++            ring_slot = self._pp_send_ring[ring_idx]
++            # Copy graph output (view of fixed captured buffer) into ring slot.
++            # The copy is on compute stream, serialized with the just-finished
++            # replay; it completes before the next replay overwrites the
++            # captured buffer, but isend operates on the ring slot.
++            _nvtx_push(f"ring_slot_copy pp={_pp} mb={_seq} slot={ring_idx}")
++            to_send: dict[str, torch.Tensor] = {}
++            for k, v in output.tensors.items():
++                n = v.shape[0]
++                ring_slot.tensors[k][:n].copy_(v, non_blocking=True)
++                to_send[k] = ring_slot.tensors[k][:n]
++            _nvtx_pop()
++
++            _nvtx_push(f"isend_issue pp={_pp} mb={_seq} slot={ring_idx}")
++            if self._pp_fast_comm:
++                # FastPPComm path
++                self._pp_send_ring_handles[ring_idx] = self._fast_pp_isend(
++                    to_send,
++                    all_gather_tensors,
++                    fallback_isend_fn=get_pp_group().isend_tensor_dict,
++                )
++            elif self._pp_skip_metadata and self._pp_cached_metadata is not None:
++                self._pp_send_ring_handles[ring_idx] = self._isend_cached(
++                    to_send, all_gather_tensors
++                )
++            else:
++                first_call_ag_group = (
++                    None if self._pp_skip_metadata else get_tp_group()
++                )
++                self._pp_send_ring_handles[ring_idx] = (
++                    get_pp_group().isend_tensor_dict(
++                        to_send,
++                        all_gather_group=first_call_ag_group,
++                        all_gather_tensors=all_gather_tensors,
++                    )
++                )
++                if self._pp_skip_metadata and self._pp_cached_metadata is None:
++                    cached = [
++                        (k, tuple(v.shape), v.dtype, v.device)
++                        for k, v in to_send.items()
++                    ]
++                    self._pp_cached_metadata = cached
++            _nvtx_pop()
++            if _trace:
++                print(
++                    f"[trace pp{self._mb_pp_rank}] ring isend slot={ring_idx} "
++                    f"step={self._pp_send_step} seq={self._mb_seq}",
++                    flush=True,
++                )
++            self._pp_send_step += 1
++        else:
++            # Legacy path: shared graph buffer is reused -> wait on prev isend
++            # before next isend so the buffer isn't overwritten mid-NCCL.
++            if _mb_overlap and self._pp_send_work:
++                _nvtx_push(f"prev_send_wait_late pp={_pp} mb={_seq}")
++                for handle in self._pp_send_work:
++                    handle.wait()
++                self._pp_send_work = []
++                _nvtx_pop()
++            _nvtx_push(f"isend_issue pp={_pp} mb={_seq}")
++            self._pp_send_work = get_pp_group().isend_tensor_dict(
++                output.tensors,
++                all_gather_group=get_tp_group(),
++                all_gather_tensors=all_gather_tensors,
++            )
++            _nvtx_pop()
++        # ---- end vllm_main patch ----
++
++        # ---- vllm_main recv-side pre-issue ----
++        # Issue the NEXT mb's irecv at the end of the current execute_model.
++        # By this point rank 0 has finished the corresponding stage-0 forward
++        # (it ran ahead of us in lockstep with batch_queue_size>1), so its
++        # send_object metadata is already in the gloo channel -> our
++        # recv_object completes immediately. The NCCL tensor irecv then
++        # runs in the background while the worker dequeues the next mb.
++        if (self._pp_recv_preissue
++                and not get_pp_group().is_first_rank
++                and self._pp_pending_recv is None):
++            _nvtx_push(f"preissue_irecv pp={_pp} mb={_seq}")
++            try:
++                self._pp_pending_recv = get_pp_group().irecv_tensor_dict(
++                    all_gather_group=get_tp_group(),
++                    all_gather_tensors=all_gather_tensors,
++                )
++            except Exception:
++                # If pre-issue fails (e.g. shutdown), fall back to the
++                # in-line irecv at the start of the next execute_model.
++                self._pp_pending_recv = None
++            _nvtx_pop()
++        # ---- end vllm_main pre-issue ----
++        _nvtx_pop()  # exec_model
++
++        if _trace:
++            import time as _t
++            _exit = _t.perf_counter()
++            print(
++                f"[trace pp{self._mb_pp_rank}] exit  execute_model t={_exit*1000:.1f}ms "
++                f"dt={(_exit-self._mb_entry_t)*1000:.1f}ms seq={self._mb_seq}",
++                flush=True,
++            )
+ 
+         return None
+ 

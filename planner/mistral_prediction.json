@@ -1,0 +1,303 @@
+{
+  "model": "mistralai/Mistral-Large-Instruct-2411",
+  "note": "PRE-REGISTERED prediction generated before sweep data existed",
+  "generated": "2026-06-13, planner fit v8 (prefill TFLOPS 2x revision, prefill_overlap rho=0.16, prefill_ar_overlap=0.8)",
+  "planner_metrics_on_4model_calibration": {"mean_regret_pct": 8.5, "median_regret_pct": 7.8, "spearman_rho": 0.78},
+  "known_caveats": [
+    "Within-PP2 layer-skew is predicted workload-INVARIANT (always BW-balance skew+12); measured PP2 skew curves are flat (<5%) so champion is noise-limited. Judge by REGRET, not exact champion match.",
+    "TP8 (cross-node, world-size TP) is under-predicted in prefill_heavy (~2.4x on 70B) due to unmodeled async-TP AR/compute overlap. If Mistral-123B behaves like 70B (where TP8+FFN-bias won prefill_heavy), the planner will MISS that topology for prefill_heavy. This is the strongest pre-registered test of the residual gap.",
+    "8B-class small-model overhead regime is out of scope (single global step_floor); not relevant at 123B."
+  ],
+  "predictions": {
+    "balanced": {
+      "TP8PP1_uniform": {
+        "tps": 414.9,
+        "feasible": true,
+        "ttft_ms": 1348.8,
+        "note": "max used 38.7GB on rank7"
+      },
+      "TP8PP1_ffn_bias+25": {
+        "tps": 435.2,
+        "feasible": true,
+        "ttft_ms": 1210.4,
+        "note": "max used 32.9GB on rank7"
+      },
+      "TP8PP1_ffn_bias+50": {
+        "tps": 447.4,
+        "feasible": true,
+        "ttft_ms": 1246.8,
+        "note": "max used 27.1GB on rank7"
+      },
+      "TP8PP1_ffn_bias+75": {
+        "tps": 435.7,
+        "feasible": true,
+        "ttft_ms": 1333.4,
+        "note": "max used 21.2GB on rank7"
+      },
+      "TP4PP2_layer_uniform_44-44": {
+        "tps": 645.8,
+        "feasible": true,
+        "ttft_ms": 1470.6,
+        "note": "max used 39.1GB on rank7"
+      },
+      "TP4PP2_layer_skew+4_48-40": {
+        "tps": 698.4,
+        "feasible": true,
+        "ttft_ms": 1437.9,
+        "note": "max used 36.0GB on rank7"
+      },
+      "TP4PP2_layer_skew+8_52-36": {
+        "tps": 760.3,
+        "feasible": true,
+        "ttft_ms": 1405.2,
+        "note": "max used 32.9GB on rank7"
+      },
+      "TP4PP2_layer_skew+12_56-32": {
+        "tps": 805.3,
+        "feasible": true,
+        "ttft_ms": 1375.1,
+        "note": "max used 29.9GB on rank7"
+      },
+      "TP4PP2_layer_skew+16_60-28": {
+        "tps": 762.9,
+        "feasible": true,
+        "ttft_ms": 1358.2,
+        "note": "max used 26.8GB on rank7"
+      },
+      "TP2PP4_layer_uniform_22-22-22-22": {
+        "tps": 0.0,
+        "feasible": false,
+        "ttft_ms": null,
+        "note": "rank6(ada) needs 40.9GB > 40.8GB cap"
+      },
+      "TP2PP4_layer_blackbias_24-24-20-20": {
+        "tps": 443.9,
+        "feasible": true,
+        "ttft_ms": 2589.7,
+        "note": "max used 37.8GB on rank7"
+      },
+      "TP2PP4_layer_blackbias_26-26-18-18": {
+        "tps": 483.8,
+        "feasible": true,
+        "ttft_ms": 2527.6,
+        "note": "max used 34.8GB on rank7"
+      },
+      "TP1PP8_layer_uniform_11x8": {
+        "tps": 0.0,
+        "feasible": false,
+        "ttft_ms": null,
+        "note": "rank4(ada) needs 42.9GB > 40.8GB cap"
+      },
+      "TP1PP8_layer_blackbias_13-13-13-13-9-9-9-9": {
+        "tps": 261.6,
+        "feasible": true,
+        "ttft_ms": 4798.2,
+        "note": "max used 38.4GB on rank7"
+      },
+      "TP1PP8_layer_blackbias_15-15-15-15-7-7-7-7": {
+        "tps": 307.3,
+        "feasible": true,
+        "ttft_ms": 4562.2,
+        "note": "max used 32.2GB on rank7"
+      }
+    },
+    "decode_heavy": {
+      "TP8PP1_uniform": {
+        "tps": 454.9,
+        "feasible": true,
+        "ttft_ms": 1347.2,
+        "note": "max used 38.1GB on rank7"
+      },
+      "TP8PP1_ffn_bias+25": {
+        "tps": 474.3,
+        "feasible": true,
+        "ttft_ms": 1208.9,
+        "note": "max used 32.3GB on rank7"
+      },
+      "TP8PP1_ffn_bias+50": {
+        "tps": 488.7,
+        "feasible": true,
+        "ttft_ms": 1246.0,
+        "note": "max used 26.5GB on rank7"
+      },
+      "TP8PP1_ffn_bias+75": {
+        "tps": 477.9,
+        "feasible": true,
+        "ttft_ms": 1332.6,
+        "note": "max used 20.7GB on rank7"
+      },
+      "TP4PP2_layer_uniform_44-44": {
+        "tps": 721.3,
+        "feasible": true,
+        "ttft_ms": 1469.1,
+        "note": "max used 38.5GB on rank7"
+      },
+      "TP4PP2_layer_skew+4_48-40": {
+        "tps": 779.8,
+        "feasible": true,
+        "ttft_ms": 1436.5,
+        "note": "max used 35.5GB on rank7"
+      },
+      "TP4PP2_layer_skew+8_52-36": {
+        "tps": 848.5,
+        "feasible": true,
+        "ttft_ms": 1404.0,
+        "note": "max used 32.5GB on rank7"
+      },
+      "TP4PP2_layer_skew+12_56-32": {
+        "tps": 906.0,
+        "feasible": true,
+        "ttft_ms": 1374.1,
+        "note": "max used 29.5GB on rank7"
+      },
+      "TP4PP2_layer_skew+16_60-28": {
+        "tps": 858.3,
+        "feasible": true,
+        "ttft_ms": 1357.2,
+        "note": "max used 26.5GB on rank7"
+      },
+      "TP2PP4_layer_uniform_22-22-22-22": {
+        "tps": 441.4,
+        "feasible": true,
+        "ttft_ms": 2650.2,
+        "note": "max used 40.3GB on rank7"
+      },
+      "TP2PP4_layer_blackbias_24-24-20-20": {
+        "tps": 478.0,
+        "feasible": true,
+        "ttft_ms": 2588.3,
+        "note": "max used 37.3GB on rank7"
+      },
+      "TP2PP4_layer_blackbias_26-26-18-18": {
+        "tps": 521.2,
+        "feasible": true,
+        "ttft_ms": 2526.4,
+        "note": "max used 34.3GB on rank7"
+      },
+      "TP1PP8_layer_uniform_11x8": {
+        "tps": 0.0,
+        "feasible": false,
+        "ttft_ms": null,
+        "note": "rank4(ada) needs 42.4GB > 40.8GB cap"
+      },
+      "TP1PP8_layer_blackbias_13-13-13-13-9-9-9-9": {
+        "tps": 274.9,
+        "feasible": true,
+        "ttft_ms": 4796.9,
+        "note": "max used 37.9GB on rank7"
+      },
+      "TP1PP8_layer_blackbias_15-15-15-15-7-7-7-7": {
+        "tps": 325.4,
+        "feasible": true,
+        "ttft_ms": 4561.1,
+        "note": "max used 31.9GB on rank7"
+      }
+    },
+    "prefill_heavy": {
+      "TP8PP1_uniform": {
+        "tps": 318.3,
+        "feasible": true,
+        "ttft_ms": 1351.5,
+        "note": "max used 40.3GB on rank7"
+      },
+      "TP8PP1_ffn_bias+25": {
+        "tps": 339.1,
+        "feasible": true,
+        "ttft_ms": 1213.2,
+        "note": "max used 34.5GB on rank7"
+      },
+      "TP8PP1_ffn_bias+50": {
+        "tps": 344.9,
+        "feasible": true,
+        "ttft_ms": 1248.2,
+        "note": "max used 28.7GB on rank7"
+      },
+      "TP8PP1_ffn_bias+75": {
+        "tps": 332.2,
+        "feasible": true,
+        "ttft_ms": 1334.7,
+        "note": "max used 22.9GB on rank7"
+      },
+      "TP4PP2_layer_uniform_44-44": {
+        "tps": 479.2,
+        "feasible": true,
+        "ttft_ms": 1473.4,
+        "note": "max used 40.7GB on rank7"
+      },
+      "TP4PP2_layer_skew+4_48-40": {
+        "tps": 519.2,
+        "feasible": true,
+        "ttft_ms": 1440.4,
+        "note": "max used 37.5GB on rank7"
+      },
+      "TP4PP2_layer_skew+8_52-36": {
+        "tps": 566.5,
+        "feasible": true,
+        "ttft_ms": 1407.5,
+        "note": "max used 34.3GB on rank7"
+      },
+      "TP4PP2_layer_skew+12_56-32": {
+        "tps": 587.2,
+        "feasible": true,
+        "ttft_ms": 1376.8,
+        "note": "max used 31.1GB on rank7"
+      },
+      "TP4PP2_layer_skew+16_60-28": {
+        "tps": 555.5,
+        "feasible": true,
+        "ttft_ms": 1360.1,
+        "note": "max used 27.9GB on rank7"
+      },
+      "TP2PP4_layer_uniform_22-22-22-22": {
+        "tps": 0.0,
+        "feasible": false,
+        "ttft_ms": null,
+        "note": "rank4(ada) needs 41.8GB > 40.8GB cap"
+      },
+      "TP2PP4_layer_blackbias_24-24-20-20": {
+        "tps": 362.7,
+        "feasible": true,
+        "ttft_ms": 2592.2,
+        "note": "max used 39.3GB on rank7"
+      },
+      "TP2PP4_layer_blackbias_26-26-18-18": {
+        "tps": 395.3,
+        "feasible": true,
+        "ttft_ms": 2529.9,
+        "note": "max used 36.1GB on rank7"
+      },
+      "TP1PP8_layer_uniform_11x8": {
+        "tps": 0.0,
+        "feasible": false,
+        "ttft_ms": null,
+        "note": "rank4(ada) needs 44.6GB > 40.8GB cap"
+      },
+      "TP1PP8_layer_blackbias_13-13-13-13-9-9-9-9": {
+        "tps": 229.7,
+        "feasible": true,
+        "ttft_ms": 4800.4,
+        "note": "max used 39.7GB on rank7"
+      },
+      "TP1PP8_layer_blackbias_15-15-15-15-7-7-7-7": {
+        "tps": 264.1,
+        "feasible": true,
+        "ttft_ms": 4564.1,
+        "note": "max used 33.3GB on rank7"
+      }
+    }
+  },
+  "champions": {
+    "balanced": {
+      "config": "TP4PP2_layer_skew+12_56-32",
+      "tps": 805.3
+    },
+    "decode_heavy": {
+      "config": "TP4PP2_layer_skew+12_56-32",
+      "tps": 906.0
+    },
+    "prefill_heavy": {
+      "config": "TP4PP2_layer_skew+12_56-32",
+      "tps": 587.2
+    }
+  }
+}

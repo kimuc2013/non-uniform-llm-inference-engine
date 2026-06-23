@@ -15,48 +15,66 @@ Requires kernel_warmup hetero fix on BOTH nodes (vllm_main (worker symlinks vllm
 from __future__ import annotations
 import argparse, json, os, signal, socket as sock, subprocess, sys, time
 from pathlib import Path
+# Allow `python planner/hetero_4x4_70b_sweep.py` invocation by ensuring the
+# repo root is on sys.path so `from planner.X` works.
+_REPO = Path(__file__).resolve().parents[1]
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 from planner.cluster_env import CFG
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = _REPO
 PY = CFG.head_py
 PERF = REPO / "perf" / "performance.py"
 HEAD_IB = CFG.head_fabric_ip
 RAY_ADDR = CFG.ray_address
-MODEL = "meta-llama/Llama-3.3-70B-Instruct"
+MODEL = "mistralai/Mistral-Large-Instruct-2411"
 
-# (label, tp, pp, layer_split, ffn_splits, head_splits, kv_splits)
-# Llama-3.3-70B: 80 layers, 64 q-heads, 8 kv-heads, FFN intermediate 28672.
+# Mistral-Large-2411 (123B): 88 layers, FFN 28672, 96 q / 8 kv (GQA 12:1), hidden 12288.
 CONFIGS = [
-    # ---- TP8 PP1: cross-node single stage ----
-    ("TP8PP1_uniform", 8, 1, [80],
-     [3584] * 8, [8] * 8, [1] * 8),
+    # ---- TP8 PP1: ffn 28672/8=3584, q 96/8=12, kv 8/8=1 per rank
+    ("TP8PP1_uniform", 8, 1, [88],
+     [3584] * 8, [12] * 8, [1] * 8),
+    ("TP8PP1_ffn_bias+25",  8, 1, [88],
+     [4480]*4 + [2688]*4, [12] * 8, [1] * 8),   # 17920+10752=28672
+    ("TP8PP1_ffn_bias+50",  8, 1, [88],
+     [5376]*4 + [1792]*4, [12] * 8, [1] * 8),   # 21504+7168
+    ("TP8PP1_ffn_bias+75",  8, 1, [88],
+     [6272]*4 +  [896]*4, [12] * 8, [1] * 8),   # 25088+3584
 
-    # ---- TP4 PP2: layer split sweep (uniform within each stage) ----
-    ("TP4PP2_layer_uniform_40-40", 4, 2, [40, 40],
-     [7168] * 4, [16] * 4, [2] * 4),
-    ("TP4PP2_layer_skew+4_44-36", 4, 2, [44, 36],
-     [7168] * 4, [16] * 4, [2] * 4),
-    ("TP4PP2_layer_skew+8_48-32", 4, 2, [48, 32],
-     [7168] * 4, [16] * 4, [2] * 4),
-    ("TP4PP2_layer_skew+12_52-28", 4, 2, [52, 28],
-     [7168] * 4, [16] * 4, [2] * 4),
-    ("TP4PP2_layer_skew+16_56-24", 4, 2, [56, 24],
-     [7168] * 4, [16] * 4, [2] * 4),
+    # ---- TP4 PP2: 88 layers = 44+44 uniform
+    ("TP4PP2_layer_uniform_44-44", 4, 2, [44, 44],
+     [7168] * 4, [24] * 4, [2] * 4),
+    ("TP4PP2_layer_skew+4_48-40", 4, 2, [48, 40],
+     [7168] * 4, [24] * 4, [2] * 4),
+    ("TP4PP2_layer_skew+8_52-36", 4, 2, [52, 36],
+     [7168] * 4, [24] * 4, [2] * 4),
+    ("TP4PP2_layer_skew+12_56-32", 4, 2, [56, 32],
+     [7168] * 4, [24] * 4, [2] * 4),
+    ("TP4PP2_layer_skew+16_60-28", 4, 2, [60, 28],
+     [7168] * 4, [24] * 4, [2] * 4),
 
-    # ---- TP2 PP4: 4 stages, 2-2 per node ----
-    ("TP2PP4_layer_uniform_20-20-20-20", 2, 4, [20, 20, 20, 20],
-     [14336] * 2, [32] * 2, [4] * 2),
-    ("TP2PP4_layer_blackbias_22-22-18-18", 2, 4, [22, 22, 18, 18],
-     [14336] * 2, [32] * 2, [4] * 2),
-    ("TP2PP4_layer_blackbias_24-24-16-16", 2, 4, [24, 24, 16, 16],
-     [14336] * 2, [32] * 2, [4] * 2),
+    # ---- TP2 PP4: 88/4 = 22 per stage uniform
+    ("TP2PP4_layer_uniform_22-22-22-22", 2, 4, [22, 22, 22, 22],
+     [14336] * 2, [48] * 2, [4] * 2),
+    ("TP2PP4_layer_blackbias_24-24-20-20", 2, 4, [24, 24, 20, 20],
+     [14336] * 2, [48] * 2, [4] * 2),
+    ("TP2PP4_layer_blackbias_26-26-18-18", 2, 4, [26, 26, 18, 18],
+     [14336] * 2, [48] * 2, [4] * 2),
+
+    # ---- TP1 PP8: 88/8 = 11 per stage uniform
+    ("TP1PP8_layer_uniform_11x8", 1, 8, [11]*8,
+     [28672], [96], [8]),
+    ("TP1PP8_layer_blackbias_13-13-13-13-9-9-9-9", 1, 8, [13,13,13,13,9,9,9,9],
+     [28672], [96], [8]),
+    ("TP1PP8_layer_blackbias_15-15-15-15-7-7-7-7", 1, 8, [15,15,15,15,7,7,7,7],
+     [28672], [96], [8]),
 ]
 
-# (name, in_len, out_len, n_req)
+# Mistral-123B is 1.76× weight of 70B → reduce n_req slightly for KV headroom on Ada
 WORKLOADS = {
-    "balanced":      (512, 256, 128),
-    "decode_heavy":  (128, 512, 128),
-    "prefill_heavy": (1024, 128, 128),
+    "balanced":      (512, 256, 96),
+    "decode_heavy":  (128, 512, 96),
+    "prefill_heavy": (1024, 128, 96),
 }
 
 
@@ -73,7 +91,7 @@ def _free_port(start=29400):
             except: pass
 
 
-def _build_env(layer_split, ffn_splits, head_splits, kv_splits):
+def _build_env(layer_split, ffn_splits, head_splits, kv_splits, cell_label=""):
     env = os.environ.copy()
     conda = str(Path(CFG.head_py).parent)
     env["PATH"] = f"{conda}:/usr/local/cuda-12.9/bin:" + env.get("PATH", "")
@@ -84,6 +102,13 @@ def _build_env(layer_split, ffn_splits, head_splits, kv_splits):
     env["VLLM_HOST_IP"] = HEAD_IB
     env["RAY_ADDRESS"] = RAY_ADDR
     env["VLLM_LOGGING_LEVEL"] = "WARNING"
+    # Model is fully downloaded locally. Force HF offline so vllm config-load
+    # skips HfApi.get_safetensors_metadata (a per-file Hub header fetch that gets
+    # 429-throttled to ~233s/file on this gated repo → 3h+ "Parse safetensors
+    # files"). Offline makes that call fail instantly (try_* swallows it) and the
+    # local cache is used. This was the cause of the 2026-06-15 smoke timeouts.
+    env["HF_HUB_OFFLINE"] = "1"
+    env["TRANSFORMERS_OFFLINE"] = "1"
     env["NCCL_DEBUG"] = "WARN"
     env["NCCL_SOCKET_IFNAME"] = f"{CFG.head_fabric_iface},{CFG.worker_fabric_iface}"
     env["NCCL_IB_HCA"] = "mlx5"
@@ -94,21 +119,36 @@ def _build_env(layer_split, ffn_splits, head_splits, kv_splits):
     env["AUTOSPLIT"] = "0"
     env["AUTO_PP_LAYER_PARTITION"] = "0"
     env["VLLM_PP_LAYER_PARTITION"] = ",".join(str(x) for x in layer_split)
-    env["TP_FFN_SPLITS"]  = ",".join(str(x) for x in ffn_splits)
-    env["TP_HEAD_SPLITS"] = ",".join(str(x) for x in head_splits)
-    env["TP_KV_SPLITS"]   = ",".join(str(x) for x in kv_splits)
-    # PP overlap patches (paper system contribution)
-    # PP overlap envs OFF for stability — cluster-restart-induced NCCL state
-    # corruption makes overlap+mb+sampled_broadcast hang on cross-node PP=2.
-    # Stock works at 1411 TPS; overlap effect measured separately on key cells.
+    env["VLLM_TP_FFN_SPLITS"]  = ",".join(str(x) for x in ffn_splits)
+    env["VLLM_TP_HEAD_SPLITS"] = ",".join(str(x) for x in head_splits)
+    env["VLLM_TP_KV_SPLITS"]   = ",".join(str(x) for x in kv_splits)
+    return env
+
+
+def _apply_pp_overlap_env(env, tp, pp, n_reqs):
+    """Fork PP overlap recipe — launcher-validated set ONLY.
+
+    Per audit of installed vllm/v1/worker/gpu_model_runner.py + scheduler.py +
+    multiproc_executor.py + launcher/pp_overlap_config.py:apply_to_env, the
+    correct enabling set is exactly four envs from auto_configure(); adding
+    VLLM_PP_OVERLAP (stale send-wait knob) or VLLM_PP_FAST_COMM (alternate
+    transport protocol) is NOT part of the M13/M14 path and one of them was
+    deadlocking cross-node P2P.
+    """
+    from launcher import pp_overlap_config as _ppc
     for k in ("VLLM_PP_SAMPLED_BROADCAST_STREAM", "VLLM_PP_MICROBATCH",
               "VLLM_PP_MICROBATCH_SIZE", "VLLM_PP_BATCH_QUEUE_SIZE",
               "VLLM_PP_OVERLAP", "VLLM_PP_FAST_COMM"):
         env.pop(k, None)
-    return env
+    if pp <= 1:
+        return
+    cfg = _ppc.auto_configure(num_reqs=n_reqs, pp_size=pp, tp_size=tp, model_name=MODEL)
+    _ppc.apply_to_env(env, cfg)
+    print(f"  [pp_overlap] mb={cfg.use_microbatch} mb_size={cfg.mb_size} "
+          f"bq={cfg.bq} broadcast_stream={cfg.enable_broadcast_stream}", flush=True)
 
 
-def launch_vllm(port, tp, pp, env, log_path):
+def launch_vllm(port, tp, pp, env, log_path, max_num_seqs=128):
     cmd = [
         PY, "-m", "vllm.entrypoints.openai.api_server",
         "--model", MODEL,
@@ -116,8 +156,8 @@ def launch_vllm(port, tp, pp, env, log_path):
         "--pipeline-parallel-size", str(pp),
         "--distributed-executor-backend", "ray",
         "--max-model-len", "4096",
-        "--max-num-seqs", "128",
-        "--gpu-memory-utilization", "0.45",
+        "--max-num-seqs", str(max_num_seqs),
+        "--gpu-memory-utilization", "0.85",
         "--dtype", "bfloat16",
         "--port", str(port),
         "--host", "0.0.0.0",
@@ -130,7 +170,7 @@ def launch_vllm(port, tp, pp, env, log_path):
                             cwd=str(REPO), preexec_fn=os.setsid)
 
 
-def wait_ready(log_path, port, timeout=1200):
+def wait_ready(log_path, port, timeout=4200):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try: txt = log_path.read_text(errors="ignore")
@@ -138,7 +178,9 @@ def wait_ready(log_path, port, timeout=1200):
         if "Application startup complete" in txt:
             return True
         if any(k in txt for k in ("out of memory", "Failed core proc",
-                                   "RuntimeError: ", "ValueError")):
+                                   "RuntimeError: ", "ValueError",
+                                   "WorkerProc hit an exception",
+                                   "CUBLAS_STATUS", "illegal memory access")):
             return False
         s = sock.socket()
         try:
@@ -176,6 +218,11 @@ def run_perf(port, in_len, out_len, n_req, out_dir, timeout=900):
     ]
     env = os.environ.copy()
     env["PATH"] = f"{Path(CFG.head_py).parent}:" + env.get("PATH", "")
+    # perf tool builds its own tokenizer via AutoTokenizer.from_pretrained; force
+    # offline so it uses the local cache (gated repos 401 online without a token,
+    # and tokenizer.model may be absent — local tokenizer.json is enough).
+    env["HF_HUB_OFFLINE"] = "1"
+    env["TRANSFORMERS_OFFLINE"] = "1"
     with (out_dir / "perf.log").open("w") as f:
         try:
             p = subprocess.run(cmd, env=env, cwd=str(REPO),
@@ -253,6 +300,89 @@ def _kill_worker_vllm():
         print(f"_kill_worker_vllm warn: {e}", flush=True)
 
 
+def _nuke_compile_cache():
+    """Clear torch_compile_cache on head + worker.
+
+    Per-cell shapes differ across (tp, pp, ffn, head, kv) splits. The AOT cache
+    is keyed in a way that does NOT include the per-rank intermediate dim, so
+    a uniform cache loaded into a bias cell causes Ada ranks to crash in the
+    inductor compiled graph (shape mismatch). Clearing between cells forces a
+    fresh compile.
+    """
+    import shutil
+    head_cache = Path("/data/esca/.cache/vllm/torch_compile_cache")
+    if head_cache.exists():
+        for child in head_cache.iterdir():
+            try: shutil.rmtree(child)
+            except Exception: pass
+    try:
+        ray = _ensure_ray()
+        node_id = _get_worker_node_id()
+        if not node_id:
+            return
+        @ray.remote(num_cpus=0.1, scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+            node_id=node_id, soft=False))
+        def clean_remote():
+            import shutil, os
+            p = os.path.expanduser("~/.cache/vllm/torch_compile_cache")
+            if not os.path.isdir(p): return 0
+            n = 0
+            for entry in os.listdir(p):
+                ep = os.path.join(p, entry)
+                try: shutil.rmtree(ep); n += 1
+                except Exception: pass
+            return n
+        ray.get(clean_remote.remote(), timeout=30)
+    except Exception as e:
+        print(f"_nuke_compile_cache warn: {e}", flush=True)
+
+
+def _conditional_defensive_cleanup():
+    """Only run aggressive cleanup if cluster has dirty state (orphan VLLM/
+    RayWorkerProc on head or worker, OR stale placement groups). On a clean
+    cluster, the per-cell stop() handles all cleanup and the at-start kill
+    just adds latency + race risk with a freshly-joined worker."""
+    import subprocess
+    head_dirty = subprocess.run(
+        ["bash", "-c", "ps -ef | grep -E 'VLLM::|ray::RayWorkerProc' | grep -v grep | wc -l"],
+        capture_output=True, text=True).stdout.strip()
+    head_dirty_count = int(head_dirty) if head_dirty.isdigit() else 0
+
+    worker_dirty_count = 0
+    try:
+        ray = _ensure_ray()
+        node_id = _get_worker_node_id()
+        if node_id:
+            @ray.remote(num_cpus=0.1, scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                node_id=node_id, soft=False))
+            def count_worker():
+                import subprocess
+                r = subprocess.run(["bash", "-c", "ps -ef | grep -E 'VLLM::|ray::RayWorkerProc' | grep -v grep | wc -l"],
+                                   capture_output=True, text=True)
+                return int(r.stdout.strip() or 0)
+            worker_dirty_count = ray.get(count_worker.remote(), timeout=20)
+    except Exception as e:
+        print(f"[cleanup] worker dirty-check failed: {e}; assuming dirty", flush=True)
+        worker_dirty_count = 999
+
+    pg_count = 0
+    try:
+        ray = _ensure_ray()
+        pg_count = len(ray.util.placement_group_table())
+    except Exception:
+        pass
+
+    print(f"[cleanup] head_dirty={head_dirty_count} worker_dirty={worker_dirty_count} pgs={pg_count}", flush=True)
+    if head_dirty_count == 0 and worker_dirty_count == 0 and pg_count == 0:
+        print(f"[cleanup] cluster clean — skip defensive cleanup", flush=True)
+        return
+    print(f"[cleanup] dirty state detected — running defensive cleanup", flush=True)
+    _kill_worker_vllm()
+    cleanup_pg()
+    _nuke_compile_cache()
+    time.sleep(10)
+
+
 def stop(proc, port):
     if proc.poll() is None:
         try: os.killpg(proc.pid, signal.SIGINT)
@@ -265,6 +395,7 @@ def stop(proc, port):
                    capture_output=True, check=False)
     _kill_worker_vllm()
     cleanup_pg()
+    _nuke_compile_cache()
     time.sleep(45)  # longer inter-cell sleep — NCCL/PG settle takes longer cross-node
 
 
@@ -286,21 +417,22 @@ def _ensure_4x4_or_setup():
 
 
 def verify_4x4():
-    """Hard fail if cluster isn't exactly HEAD_GPUS on head + WORKER_GPUS on worker.
-    Paper claim is hetero serving with the given split — any other split makes
-    the run invalid.
-    """
+    """Hard fail if cluster isn't HEAD_GPUS on head + WORKER_GPUS on worker.
+    Stale-tolerant: per-IP max alive node only (transient duplicate node ids
+    during restart are ignored)."""
     ray = _ensure_ray()
-    res = ray.cluster_resources()
-    total = res.get('GPU', 0)
     nodes = [n for n in ray.nodes() if n.get('alive')]
-    by_ip = {n['NodeManagerAddress']: n.get('Resources', {}).get('GPU', 0) for n in nodes}
+    by_ip: dict[str, float] = {}
+    for n in nodes:
+        ip = n['NodeManagerAddress']
+        g = n.get('Resources', {}).get('GPU', 0)
+        by_ip[ip] = max(by_ip.get(ip, 0), g)
     head_gpu = by_ip.get(CFG.head_fabric_ip, 0)
     worker_gpu = by_ip.get(CFG.worker_fabric_ip, 0)
-    want = CFG.head_gpus + CFG.worker_gpus
-    print(f"[verify_4x4] total GPU={total}, head={CFG.head_gpus} expected got {head_gpu}, "
-          f"worker={CFG.worker_gpus} expected got {worker_gpu}", flush=True)
-    if total != want or head_gpu != CFG.head_gpus or worker_gpu != CFG.worker_gpus:
+    total = head_gpu + worker_gpu
+    print(f"[verify_4x4] (deduped) head={head_gpu}/{CFG.head_gpus}, "
+          f"worker={worker_gpu}/{CFG.worker_gpus}, total={total}", flush=True)
+    if head_gpu != CFG.head_gpus or worker_gpu != CFG.worker_gpus:
         raise RuntimeError(
             f"{CFG.head_gpus}+{CFG.worker_gpus} cluster check FAILED. "
             f"Got total={total} head={head_gpu} worker={worker_gpu}. "
@@ -316,6 +448,7 @@ def verify_4x4():
 
 def main():
     _ensure_4x4_or_setup()
+    _conditional_defensive_cleanup()
     ap = argparse.ArgumentParser()
     ap.add_argument("--workloads", default="balanced,decode_heavy,prefill_heavy")
     ap.add_argument("--configs", default="all",
@@ -330,7 +463,7 @@ def main():
         cfgs = [c for c in CONFIGS if c[0] in wanted]
 
     ts = time.strftime("%Y%m%d_%H%M%S")
-    out_root = REPO / "results" / f"hetero_4x4_70b_full_{ts}"
+    out_root = REPO / "results" / f"hetero_4x4_mistral123b_full_{ts}"
     out_root.mkdir(parents=True, exist_ok=True)
     print(f"OUT: {out_root}", flush=True)
     print(f"CONFIGS: {len(cfgs)}, WORKLOADS: {len(wls)}, "
@@ -340,15 +473,16 @@ def main():
     for label, tp, pp, layer_split, ffn, head, kv in cfgs:
         for wl in wls:
             in_len, out_len, n_req = WORKLOADS[wl]
-            cell = f"70b_{label}_{wl}"
+            cell = f"mistral123b_{label}_{wl}"
             print(f"\n[{cell}] tp={tp} pp={pp} layers={layer_split} "
                   f"in={in_len} out={out_len} n={n_req}", flush=True)
             cell_dir = out_root / cell
             port = _free_port()
-            env = _build_env(layer_split, ffn, head, kv)
+            env = _build_env(layer_split, ffn, head, kv, cell_label=label)
+            _apply_pp_overlap_env(env, tp, pp, n_req)
             log_path = cell_dir / "vllm.log"
-            proc = launch_vllm(port, tp, pp, env, log_path)
-            ready = wait_ready(log_path, port, timeout=1200)
+            proc = launch_vllm(port, tp, pp, env, log_path, max_num_seqs=128)
+            ready = wait_ready(log_path, port, timeout=4200)  # 123B cold load is slow (~50min parse); generous
             if not ready:
                 rec = {"cell": cell, "label": label,
                        "tp": tp, "pp": pp,

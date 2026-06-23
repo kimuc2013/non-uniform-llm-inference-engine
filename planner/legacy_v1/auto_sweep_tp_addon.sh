@@ -1,22 +1,14 @@
 #!/bin/bash
-# Fully autonomous hetero-cluster sweep runner.
-#   1) PP verify (1 cell) — must beat $PP_VERIFY_FLOOR_TPS to proceed
-#   2) Full ours sweep (70B 27 + 8B 27)
-#   3) Per-cell auto-retry: cleanup → cluster restart between attempts
-#
-# All site-specific info comes from cluster.local.env (gitignored).
+# Add-on sweep: TP=8 PP=1 hetero variants only (FFN/head bias, hybrid).
+# Existing PP/layer-skew + uniform-TP cells are kept as-is; this script only
+# fills in the missing non-uniform-TP cells.
 
 set -u
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REPO="$( dirname "$SCRIPT_DIR" )"
-if [ ! -f "$REPO/cluster.local.env" ]; then
-    echo "[fatal] $REPO/cluster.local.env not found. Copy cluster.example.env and fill it in."
-    exit 1
-fi
 source "$REPO/cluster.local.env"
 PY="$HEAD_PY"
-PP_VERIFY_FLOOR_TPS="${PP_VERIFY_FLOOR_TPS:-1200}"
-LOG="${LOG:-/tmp/auto_sweep.log}"
+LOG="${LOG:-/tmp/auto_sweep_tp.log}"
 exec > >(tee -a "$LOG") 2>&1
 cd "$REPO"
 
@@ -51,7 +43,6 @@ restart_cluster() {
     cleanup_all
     "$PY" "$REPO/planner/cluster_setup_4x4.py" --force 2>&1 | tail -3
     sleep 5
-    # Direct ssh worker restart as fallback (cluster_setup also tries this)
     ssh -o ConnectTimeout=5 -p "$WORKER_SSH_PORT" "$WORKER_SSH_USER@$WORKER_SSH_HOST" "
         $WORKER_RAY stop --force 2>&1 | tail -2
         sleep 5
@@ -65,7 +56,6 @@ restart_cluster() {
     echo "[$(ts)] cluster state: $(verify_cluster)"
 }
 
-# Find latest record.json for a given cell pattern; print "tps ok"
 last_cell_result() {
     pattern="$1"
     rec=$(ls -t "$REPO"/results/hetero_4x4_*_full_*/"$pattern"/record.json 2>/dev/null | head -1)
@@ -99,39 +89,29 @@ run_cell_with_retry() {
     return 1
 }
 
-# === 1) PP verify ===
-echo "[$(ts)] === STAGE 1: PP verify (TP4PP2 [uniform] balanced 70B, must > $PP_VERIFY_FLOOR_TPS TPS) ==="
-if ! verify_cluster | grep -q OK; then restart_cluster; fi
-
-run_cell_with_retry hetero_4x4_70b_sweep.py TP4PP2_layer_uniform_40-40 balanced
-result=$(last_cell_result "70b_TP4PP2_layer_uniform_40-40_balanced")
-tps=$(echo "$result" | awk '{print $1}')
-if (( $(echo "$tps < $PP_VERIFY_FLOOR_TPS" | bc -l) )); then
-    echo "[$(ts)] PP verify FAILED ($tps TPS < $PP_VERIFY_FLOOR_TPS) — STOPPING"
-    exit 1
-fi
-echo "[$(ts)] === PP verify PASSED ($tps TPS) ==="
-
-# === 2) Full 70B sweep ===
-echo "[$(ts)] === STAGE 2: full 70B sweep ==="
-CONFIGS_70B="TP8PP1_uniform TP4PP2_layer_uniform_40-40 TP4PP2_layer_skew+4_44-36 TP4PP2_layer_skew+8_48-32 TP4PP2_layer_skew+12_52-28 TP4PP2_layer_skew+16_56-24 TP2PP4_layer_uniform_20-20-20-20 TP2PP4_layer_blackbias_22-22-18-18 TP2PP4_layer_blackbias_24-24-16-16"
+# TP=8 PP=1 hetero variants only (uniform already measured in earlier sweep)
+# Head bias and Hybrid skipped: with 8 KV heads / 8 TP ranks, KV per rank = 1
+# and q/kv ratio must stay consistent across ranks (GQA constraint). Head bias
+# breaks this — vllm raises ValueError. FFN bias has no such constraint.
+TP_CONFIGS="TP8PP1_ffn_bias+25 TP8PP1_ffn_bias+50 TP8PP1_ffn_bias+75"
 WORKLOADS="balanced decode_heavy prefill_heavy"
-for cfg in $CONFIGS_70B; do
+
+echo "[$(ts)] === STAGE 1: cluster check ==="
+if ! verify_cluster | grep -q OK; then restart_cluster; fi
+echo "[$(ts)] cluster: $(verify_cluster)"
+
+echo "[$(ts)] === STAGE 2: 70B TP hetero variants ==="
+for cfg in $TP_CONFIGS; do
     for wl in $WORKLOADS; do
-        if [ "$cfg" == "TP4PP2_layer_uniform_40-40" ] && [ "$wl" == "balanced" ]; then continue; fi
         run_cell_with_retry hetero_4x4_70b_sweep.py "$cfg" "$wl" || true
     done
 done
 
-# === 3) Full 8B sweep ===
-echo "[$(ts)] === STAGE 3: full 8B sweep ==="
-CONFIGS_8B="TP8PP1_uniform TP4PP2_layer_uniform_16-16 TP4PP2_layer_skew+2_18-14 TP4PP2_layer_skew+4_20-12 TP4PP2_layer_skew+6_22-10 TP4PP2_layer_skew+8_24-8 TP2PP4_layer_uniform_8-8-8-8 TP2PP4_layer_blackbias_9-9-7-7 TP2PP4_layer_blackbias_10-10-6-6"
-for cfg in $CONFIGS_8B; do
+echo "[$(ts)] === STAGE 3: 8B TP hetero variants ==="
+for cfg in $TP_CONFIGS; do
     for wl in $WORKLOADS; do
         run_cell_with_retry hetero_4x4_8b_sweep.py "$cfg" "$wl" || true
     done
 done
 
 echo "[$(ts)] === ALL DONE ==="
-echo "70B records: $(ls $REPO/results/hetero_4x4_70b_full_*/*/record.json 2>/dev/null | wc -l)"
-echo "8B  records: $(ls $REPO/results/hetero_4x4_8b_full_*/*/record.json 2>/dev/null | wc -l)"

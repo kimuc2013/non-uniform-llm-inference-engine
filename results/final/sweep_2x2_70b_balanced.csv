@@ -1,0 +1,5 @@
+label,tp,pp,layer_split,ffn_B:A,tps,itl_ms,ttft_ms,success
+uniform_TP4,4,1,80,7168:7168,267.5,56.6,836,True
+nonuniform_TP4,4,1,80,9600:4736,302.0,50.0,772,True
+uniform_PP,2,2,40-40,14336:14336,177.5,86.8,897,True
+nonuniform_PP,2,2,52-28,14336:14336,217.9,68.7,1209,True

@@ -1,0 +1,16 @@
+cell,label,tp,pp,layer_split,workload,tps,runtime_s,ttft_ms,success
+qwen32b_TP2PP4_layer_blackbias_18-18-14-14_balanced,TP2PP4_layer_blackbias_18-18-14-14,2,4,18-18-14-14,balanced,842.1,38.9,315.5,True
+qwen32b_TP2PP4_layer_blackbias_18-18-14-14_decode_heavy,TP2PP4_layer_blackbias_18-18-14-14,2,4,18-18-14-14,decode_heavy,844.2,77.6,687.8,True
+qwen32b_TP2PP4_layer_blackbias_18-18-14-14_prefill_heavy,TP2PP4_layer_blackbias_18-18-14-14,2,4,18-18-14-14,prefill_heavy,0.0,0.0,0.0,False
+qwen32b_TP2PP4_layer_blackbias_20-20-12-12_balanced,TP2PP4_layer_blackbias_20-20-12-12,2,4,20-20-12-12,balanced,859.7,38.1,368.2,True
+qwen32b_TP2PP4_layer_blackbias_20-20-12-12_decode_heavy,TP2PP4_layer_blackbias_20-20-12-12,2,4,20-20-12-12,decode_heavy,865.5,75.7,474.9,True
+qwen32b_TP2PP4_layer_blackbias_20-20-12-12_prefill_heavy,TP2PP4_layer_blackbias_20-20-12-12,2,4,20-20-12-12,prefill_heavy,190.0,85.8,32394.2,True
+qwen32b_TP1PP8_layer_uniform_8x8_balanced,TP1PP8_layer_uniform_8x8,1,8,8-8-8-8-8-8-8-8,balanced,135.4,241.3,86122.2,True
+qwen32b_TP1PP8_layer_uniform_8x8_decode_heavy,TP1PP8_layer_uniform_8x8,1,8,8-8-8-8-8-8-8-8,decode_heavy,223.4,292.5,23183.0,True
+qwen32b_TP1PP8_layer_uniform_8x8_prefill_heavy,TP1PP8_layer_uniform_8x8,1,8,8-8-8-8-8-8-8-8,prefill_heavy,56.0,290.9,129658.7,True
+qwen32b_TP1PP8_layer_blackbias_10-10-10-10-6-6-6-6_balanced,TP1PP8_layer_blackbias_10-10-10-10-6-6-6-6,1,8,10-10-10-10-6-6-6-6,balanced,128.7,253.7,81149.4,True
+qwen32b_TP1PP8_layer_blackbias_10-10-10-10-6-6-6-6_decode_heavy,TP1PP8_layer_blackbias_10-10-10-10-6-6-6-6,1,8,10-10-10-10-6-6-6-6,decode_heavy,0.0,0.0,0.0,False
+qwen32b_TP1PP8_layer_blackbias_10-10-10-10-6-6-6-6_prefill_heavy,TP1PP8_layer_blackbias_10-10-10-10-6-6-6-6,1,8,10-10-10-10-6-6-6-6,prefill_heavy,49.5,328.3,174967.0,True
+qwen32b_TP1PP8_layer_blackbias_12-12-12-12-4-4-4-4_balanced,TP1PP8_layer_blackbias_12-12-12-12-4-4-4-4,1,8,12-12-12-12-4-4-4-4,balanced,137.5,237.9,56847.2,True
+qwen32b_TP1PP8_layer_blackbias_12-12-12-12-4-4-4-4_decode_heavy,TP1PP8_layer_blackbias_12-12-12-12-4-4-4-4,1,8,12-12-12-12-4-4-4-4,decode_heavy,0.0,0.0,0.0,False
+qwen32b_TP1PP8_layer_blackbias_12-12-12-12-4-4-4-4_prefill_heavy,TP1PP8_layer_blackbias_12-12-12-12-4-4-4-4,1,8,12-12-12-12-4-4-4-4,prefill_heavy,40.1,405.8,198054.7,True
