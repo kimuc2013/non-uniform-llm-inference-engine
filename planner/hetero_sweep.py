@@ -328,11 +328,14 @@ def main():
     ap.add_argument("--workloads", default="balanced,decode_heavy,prefill_heavy")
     ap.add_argument("--configs", default="all", help="comma-sep label substrings, or 'all'")
     ap.add_argument("--n-req", type=int, default=0, help="override per-model default")
+    ap.add_argument("--n-req-list", default="", help="concurrency sweep: comma-sep n_reqs run "
+                    "against ONE loaded server per config (no reload). e.g. 8,16,32,64,96")
     ap.add_argument("--dry-run", action="store_true", help="print config grid, no launch")
     args = ap.parse_args()
 
     model = PP.MODELS[args.model].name
     n_req = args.n_req or DEFAULT_NREQ.get(args.model, 96)
+    n_req_list = [int(x) for x in args.n_req_list.split(",") if x.strip()] or [n_req]
     wls = [w.strip() for w in args.workloads.split(",")]
     grid = gen_configs(args.model, args.head_gpus, args.worker_gpus)
     if args.configs != "all":
@@ -356,38 +359,47 @@ def main():
     out_root = REPO / "results" / f"hetero_{args.head_gpus}x{args.worker_gpus}_{args.model}_{ts}"
     out_root.mkdir(parents=True, exist_ok=True)
     print(f"OUT: {out_root}", flush=True)
+    max_seqs = max(max(n_req_list), 16)
     runs = []
     for label, tp, pp, ls, ffn, head, kv in grid:
         for wl in wls:
             in_len, out_len = WORKLOAD_SHAPE[wl]
             cell = f"{args.model}_{label}_{wl}"
-            print(f"\n[{cell}] tp={tp} pp={pp} L={ls} ffn={ffn[0]}:{ffn[-1]} in={in_len} out={out_len} n={n_req}", flush=True)
+            print(f"\n[{cell}] tp={tp} pp={pp} L={ls} ffn={ffn[0]}:{ffn[-1]} in={in_len} out={out_len} n_req={n_req_list}", flush=True)
             cdir = out_root / cell
             port = _free_port()
             env = _build_env(model, ls, ffn, head, kv)
-            _apply_pp_overlap_env(env, tp, pp, n_req, model)
-            proc = launch_vllm(model, port, tp, pp, env, cdir/"vllm.log", max_num_seqs=max(n_req, 16))
-            rec = {"cell": cell, "label": label, "tp": tp, "pp": pp, "layer_split": ls,
-                   "ffn_splits": ffn, "head_splits": head, "kv_splits": kv, "workload": wl,
-                   "in_len": in_len, "out_len": out_len, "n_req": n_req}
+            # PP overlap auto-tuner keyed on the largest concurrency in the sweep
+            _apply_pp_overlap_env(env, tp, pp, max(n_req_list), model)
+            proc = launch_vllm(model, port, tp, pp, env, cdir/"vllm.log", max_num_seqs=max_seqs)
+            base = {"cell": cell, "label": label, "tp": tp, "pp": pp, "layer_split": ls,
+                    "ffn_splits": ffn, "head_splits": head, "kv_splits": kv, "workload": wl,
+                    "in_len": in_len, "out_len": out_len}
             if not wait_ready(cdir/"vllm.log", port):
-                stop(proc, port); rec.update(success=False, reason="not_ready")
+                stop(proc, port)
+                rec = {**base, "n_req": n_req_list[0], "success": False, "reason": "not_ready"}
                 (cdir/"record.json").write_text(json.dumps(rec, indent=2)); runs.append(rec)
                 print("  FAILED: not ready", flush=True); continue
-            mtr = run_perf(model, port, in_len, out_len, n_req, cdir)
+            # one load, perf at each concurrency (no reload) — the cheap concurrency sweep
+            cell_recs = []
+            for n in n_req_list:
+                sub = cdir / f"n{n}" if len(n_req_list) > 1 else cdir
+                mtr = run_perf(model, port, in_len, out_len, n, sub)
+                rec = {**base, "n_req": n, "success": bool(mtr.get("perf_ok")),
+                       "tps": mtr.get("total_wall_throughput_tok_s", 0.0),
+                       "ttft_ms": mtr.get("TTFT_ms_mean", 0.0), "itl_ms": mtr.get("itl_ms_mean", 0.0),
+                       "runtime_s": mtr.get("total_request_time_s", 0.0)}
+                cell_recs.append(rec); runs.append(rec)
+                print(f"  n={n}: success={rec['success']} tps={rec['tps']:.1f} itl={rec['itl_ms']:.1f}ms", flush=True)
             stop(proc, port)
-            rec.update(success=bool(mtr.get("perf_ok")), tps=mtr.get("total_wall_throughput_tok_s", 0.0),
-                       ttft_ms=mtr.get("TTFT_ms_mean", 0.0), itl_ms=mtr.get("itl_ms_mean", 0.0),
-                       runtime_s=mtr.get("total_request_time_s", 0.0))
-            (cdir/"record.json").write_text(json.dumps(rec, indent=2)); runs.append(rec)
-            print(f"  done: success={rec['success']} tps={rec.get('tps',0):.1f} itl={rec.get('itl_ms',0):.1f}ms", flush=True)
+            (cdir/"record.json").write_text(json.dumps(cell_recs if len(cell_recs) > 1 else cell_recs[0], indent=2))
     import csv
     with (out_root/"all_runs.csv").open("w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["cell","label","tp","pp","layer_split","workload","tps","itl_ms","ttft_ms","success"])
+        w.writerow(["cell","label","tp","pp","layer_split","workload","n_req","tps","itl_ms","ttft_ms","success"])
         for r in runs:
             w.writerow([r["cell"], r["label"], r["tp"], r["pp"], "-".join(map(str, r["layer_split"])),
-                        r["workload"], f"{r.get('tps',0):.1f}", f"{r.get('itl_ms',0):.1f}",
+                        r["workload"], r.get("n_req"), f"{r.get('tps',0):.1f}", f"{r.get('itl_ms',0):.1f}",
                         f"{r.get('ttft_ms',0):.0f}", r.get("success")])
     print(f"\nWrote {out_root/'all_runs.csv'}", flush=True)
     return 0
