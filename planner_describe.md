@@ -324,6 +324,12 @@ Calibration fit: champion 25/34, **mean regret 2.1%** (median 0%), top-3 32/34, 
    - **PP-skew (non-uniform PP)** grows as GPUs *increase*: 4+4 +38.6% → 2+2 +21.8% → 1+1
      +16.7% (more stages → more imbalance to correct).
    → *which* non-uniform knob matters depends on the layout.
+3. **Beats the naive baseline at production load** (self-validation on a HELD-OUT
+   workload, chat in=768/out=256, never calibrated; vs naive TP8-uniform):
+   at n≥64 the planner's pick wins **+37–51% (8B)** and **+40–66% (70B)**. At low
+   load it is mixed — 70B n=16 +5%, but **8B n=16 −26%** (a real miss: see §8). The
+   bar the project actually cares about ("beat baseline") holds in 5/6 cells and is
+   decisive in the throughput-serving regime. (`figures/fig_selfval_vs_baseline.png`.)
 
 ---
 
@@ -336,6 +342,12 @@ Calibration fit: champion 25/34, **mean regret 2.1%** (median 0%), top-3 32/34, 
   driven, not addressed by the AR fix.
 - **2+2 n=32 crossover point**: the NVLink fix nudged the planner to cross to PP one step
   early there (one zero-refit cell, 18.5%).
+- **Workload-shifted crossover** (surfaced by the held-out self-validation): the
+  TP→PP crossover *concurrency* moves with the workload — a longer-prefill workload
+  (chat in=768) keeps TP=world winning to higher n than the calibrated balanced (512)
+  does. The planner did not shift the crossover enough for **8B chat n=16**, picking
+  TP4PP2 where TP8-uniform actually won (−26% vs baseline). Same family as the low-n
+  crossover-precision residual; a workload-dependent crossover term would address it.
 - **Deliberate approximations** (not bugs): quadratic-attention prefill term dropped; the PP
   bubble / exposed-P2P terms are moot under the fitted η→1; `decode_weight_of`'s `/12` is a
   routing heuristic; non-uniform FFN/head bias is generated only for pp=1 (correct for

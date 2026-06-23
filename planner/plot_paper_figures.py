@@ -171,7 +171,50 @@ def fig_validation():
     fig.savefig(p, dpi=140, bbox_inches="tight"); plt.close(fig); print("saved", p)
 
 
+# ---------- Figure 4: self-validation vs baseline (held-out workload) ----------
+def fig_selfval(workload="chat", in_len=768, out_len=256):
+    hw = P.load_hardware()
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    for ax, mk, title in zip(axes, ["8b", "70b"], ["Llama-3.1-8B", "Llama-3.3-70B"]):
+        m = P.MODELS[mk]
+        cells = []
+        for d in (Path(x) for x in glob.glob(str(REPO / f"results/hetero_4x4_{mk}_*")) if "_full_" not in x):
+            for rj in glob.glob(str(d / "*/record.json")):
+                recs = json.load(open(rj))
+                for e in (recs if isinstance(recs, list) else [recs]):
+                    if e.get("success") and e.get("workload") == workload and e.get("tps", 0) > 0:
+                        cells.append(e)
+        if not cells:
+            ax.set_visible(False); continue
+        byn = defaultdict(list)
+        for e in cells: byn[e["n_req"]].append(e)
+        ns = sorted(byn); pick = []; base = []; best = []
+        for n in ns:
+            es = byn[n]; w = P.Workload(in_len, out_len, n); rows = []
+            for e in es:
+                cfg = P.Config(e["tp"], e["pp"], list(e["layer_split"]), list(e["ffn_splits"]),
+                               list(e["head_splits"]), list(e["kv_splits"]), e["label"])
+                rows.append((e["label"], e["tps"], P.predict(m, hw, w, cfg, overlap=(e["pp"] > 1)).get("tps", 0)))
+            pick.append(max(rows, key=lambda r: r[2])[1]); best.append(max(r[1] for r in rows))
+            b = [r for r in rows if r[0] == "TP8PP1_uniform"]; base.append(b[0][1] if b else 0)
+        x = np.arange(len(ns)); w = 0.27
+        ax.bar(x - w, base, w, label="baseline (TP8 uniform)", color="#999999")
+        ax.bar(x, pick, w, label="planner pick", color="#1f77b4")
+        ax.bar(x + w, best, w, label="measured best", color="#2ca02c", alpha=0.6)
+        for i, (p, b) in enumerate(zip(pick, base)):
+            d = (p / b - 1) * 100 if b else 0
+            ax.text(i, max(p, b) + max(best) * 0.02, f"{d:+.0f}%", ha="center",
+                    fontsize=9, fontweight="bold", color="green" if d >= 0 else "red")
+        ax.set_xticks(x); ax.set_xticklabels([f"n={n}" for n in ns]); ax.set_title(title, fontweight="bold")
+        ax.set_ylabel("throughput (tok/s)"); ax.grid(axis="y", alpha=0.3); ax.legend(fontsize=8)
+    fig.suptitle(f"Self-validation on a HELD-OUT workload ({workload} in={in_len}/out={out_len}, "
+                 "not in calibration): planner vs naive baseline", fontsize=11)
+    plt.tight_layout(); p = OUT / "fig_selfval_vs_baseline.png"
+    fig.savefig(p, dpi=140, bbox_inches="tight"); plt.close(fig); print("saved", p)
+
+
 if __name__ == "__main__":
     fig_crossover()
     fig_layout_gain()
     fig_validation()
+    fig_selfval()
