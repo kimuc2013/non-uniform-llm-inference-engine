@@ -124,16 +124,13 @@ def _free_port(start=29400):
 
 def _build_env(model, layer_split, ffn, head, kv):
     env = os.environ.copy()
-    conda = str(Path(CFG.head_py).parent)
-    env["PATH"] = f"{conda}:/usr/local/cuda-12.9/bin:" + env.get("PATH", "")
-    env["CC"] = "gcc-12"; env["CXX"] = "g++-12"; env["NVCC_CCBIN"] = "g++-12"
-    env["CUDA_HOME"] = "/usr/local/cuda-12.9"
+    CFG.build_toolchain_env(env)        # conda + optional CUDA/CC/CXX (site config, not hardcoded)
     env["VLLM_HOST_IP"] = HEAD_IB; env["RAY_ADDRESS"] = RAY_ADDR
     env["VLLM_LOGGING_LEVEL"] = "WARNING"
     env["HF_HUB_OFFLINE"] = "1"; env["TRANSFORMERS_OFFLINE"] = "1"   # gated-model safe, no Hub throttle
     env["NCCL_DEBUG"] = "WARN"
     env["NCCL_SOCKET_IFNAME"] = f"{CFG.head_fabric_iface},{CFG.worker_fabric_iface}"
-    env["NCCL_IB_HCA"] = "mlx5"; env["NCCL_NET_GDR_LEVEL"] = "2"
+    env["NCCL_IB_HCA"] = CFG.nccl_ib_hca; env["NCCL_NET_GDR_LEVEL"] = CFG.nccl_net_gdr_level
     env["VLLM_USE_FLASHINFER_SAMPLER"] = "0"; env["VLLM_USE_FLASHINFER_MOE"] = "0"
     env["AUTO_TP_SPLIT"] = "0"; env["AUTOSPLIT"] = "0"; env["AUTO_PP_LAYER_PARTITION"] = "0"
     env["VLLM_PP_LAYER_PARTITION"] = ",".join(map(str, layer_split))
@@ -274,7 +271,7 @@ def cleanup_pg():
 
 def _nuke_compile_cache():
     import shutil
-    hc = Path("/data/esca/.cache/vllm/torch_compile_cache")
+    hc = Path(CFG.head_compile_cache)
     if hc.exists():
         for c in hc.iterdir():
             try: shutil.rmtree(c)

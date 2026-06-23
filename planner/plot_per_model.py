@@ -110,7 +110,7 @@ WL_COLOR = {"balanced":"#4c72b0", "decode_heavy":"#dd8452", "prefill_heavy":"#55
 
 def collect(model: str) -> dict:
     """Walk all sweep dirs for this model, collect tps with overlap preference."""
-    pat = f"/data/esca/uckim/vllm_main/results/hetero_4x4_{model}_full_*"
+    pat = f"{REPO}/results/hetero_4x4_{model}_full_*"
     dirs = sorted(glob.glob(pat), key=os.path.getmtime)
     rows = []
     for d in dirs:

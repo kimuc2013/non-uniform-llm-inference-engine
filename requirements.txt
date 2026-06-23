@@ -1,0 +1,16 @@
+# Core deps for the heterogeneous TP/PP framework (versions used on the dev cluster).
+# vLLM must then be patched — see patches/APPLY.md.
+vllm==0.22.0
+torch==2.11.0
+ray==2.55.1                # cross-node Ray; keep head & worker on the SAME version
+transformers==4.57.6
+huggingface_hub==0.36.2
+safetensors==0.7.0
+# planner / analysis
+numpy==2.2.6
+scipy==1.15.3              # fit_planner (differential_evolution, spearman)
+matplotlib==3.10.9         # figures
+# notes:
+#  - install vllm first (pulls compatible torch); pin torch only if you must match.
+#  - nsight-systems (nsys) is an external tool, not pip — needed only for PP-overlap profiling.
+#  - gated models (Llama, Mistral) need `huggingface-cli login` + license acceptance.

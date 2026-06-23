@@ -54,10 +54,41 @@ class ClusterConfig:
     nccl_ib_hca: str
     nccl_net_gdr_level: str
     tempdir: str
+    # Optional build toolchain (leave blank in cluster.local.env to use system
+    # defaults). Needed only if vLLM/torch trigger an on-the-fly compile.
+    cuda_home: str
+    cc: str
+    cxx: str
+    nsys_bin: str
+    compile_cache_dir: str
 
     @property
     def ssh_target(self) -> str:
         return f"{self.worker_ssh_user}@{self.worker_ssh_host}"
+
+    @property
+    def conda_bin(self) -> str:
+        return str(Path(self.head_py).parent)
+
+    @property
+    def head_compile_cache(self) -> str:
+        return self.compile_cache_dir or os.path.expanduser("~/.cache/vllm/torch_compile_cache")
+
+    def build_toolchain_env(self, env: dict) -> dict:
+        """Prepend conda (+ CUDA) to PATH and set CC/CXX/CUDA_HOME — only the
+        ones configured; otherwise leave the system defaults. Shared by every
+        script that launches vLLM (which may JIT-compile)."""
+        paths = [self.conda_bin]
+        if self.cuda_home:
+            paths.append(f"{self.cuda_home}/bin")
+            env["CUDA_HOME"] = self.cuda_home
+        env["PATH"] = ":".join(paths) + ":" + env.get("PATH", "")
+        if self.cc:
+            env["CC"] = self.cc
+        if self.cxx:
+            env["CXX"] = self.cxx
+            env["NVCC_CCBIN"] = self.cxx
+        return env
 
 
 def load(path: Path | None = None) -> ClusterConfig:
@@ -96,6 +127,11 @@ def load(path: Path | None = None) -> ClusterConfig:
         nccl_ib_hca=g("NCCL_IB_HCA", "mlx5"),
         nccl_net_gdr_level=g("NCCL_NET_GDR_LEVEL", "2"),
         tempdir=g("TEMPDIR", "/tmp/vllm_ray"),
+        cuda_home=g("CUDA_HOME"),
+        cc=g("CC"),
+        cxx=g("CXX"),
+        nsys_bin=g("NSYS_BIN", "nsys"),
+        compile_cache_dir=g("COMPILE_CACHE_DIR"),
     )
 
 

@@ -57,8 +57,8 @@ vLLM is **not** vendored — install 0.22.0 and apply the patch (keeps this a th
 ## Setup on a new server
 ```bash
 # 1. env + vLLM + patch
-pip install vllm==0.22.0   # plus deps: torch, ray, matplotlib, scipy, ...
-#    apply the source patch onto the installed vLLM — see patches/APPLY.md
+pip install -r requirements.txt          # vllm 0.22.0 + torch/ray/scipy/matplotlib/transformers (pinned)
+#    then apply the source patch onto the installed vLLM — see patches/APPLY.md
 # 2. cluster config (no secrets in the repo)
 cp cluster.example.env cluster.local.env   # edit: IPs, GPU counts, IB ifaces, python paths
 # 3. bring up Ray (cross-node). Per-node NCCL/GLOO ifaces matter:
@@ -66,6 +66,25 @@ cp cluster.example.env cluster.local.env   # edit: IPs, GPU counts, IB ifaces, p
 #    worker: NCCL_SOCKET_IFNAME=<worker_iface> ray start --address=<head>:6379 --node-ip-address=<worker_fabric_ip> --num-gpus N
 #    (planner/cluster_setup_4x4.py automates this; `ray status` must show head+worker GPUs)
 ```
+
+### Models / HF access
+Model weights are **not** in the repo (re-download). Gated models (Llama-3.x,
+Mistral-Large) need a token + accepted license:
+```bash
+huggingface-cli login                    # token with access to the gated repos
+# accept the license on huggingface.co for each model, then it downloads on first use
+```
+On a node where the model is already cached, set `HF_HUB_OFFLINE=1` (the sweep
+does this automatically) to skip Hub metadata fetches — gated repos otherwise
+429-throttle the per-shard header calls and stall model load for hours.
+
+> **Site-specific helper scripts.** Core paths are config-driven (cluster.local.env)
+> or repo-relative. A few **reproduction utilities** still hardcode the dev cluster
+> — `planner/nsys_pp_overlap_*.py` and `planner/verify_pp_overlap_torch_profiler.py`
+> (worker SSH target, nsight path) and `planner/plot_4topology_nonuniform.py` /
+> `planner/analyze_pp_overlap_trace.py` (specific result-dir timestamps). Use them as
+> templates: set the toolchain in cluster.local.env (`CUDA_HOME/CC/CXX/NSYS_BIN`) and
+> point them at your own result dirs.
 
 ## Run a sweep (generalized)
 ```bash

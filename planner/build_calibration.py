@@ -32,9 +32,11 @@ import os
 import re
 import sys
 from collections import defaultdict
+from pathlib import Path
 
-RESULTS_GLOB = "/data/esca/uckim/vllm_main/results/hetero_4x4_*_full_*"
-OUT_CSV = "/data/esca/uckim/vllm_main/planner/calibration_data.csv"
+_REPO = Path(__file__).resolve().parents[1]      # repo-relative, not hardcoded
+RESULTS_GLOB = str(_REPO / "results" / "hetero_4x4_*_full_*")
+OUT_CSV = str(_REPO / "planner" / "calibration_data.csv")
 
 # 70b dirs whose PP cells were run with stock vLLM PP (no overlap fork).
 STOCK_PP_DIRS_70B = {"hetero_4x4_70b_full_20260609_122900"}
