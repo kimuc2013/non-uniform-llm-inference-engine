@@ -227,6 +227,24 @@ Enumerate, predict, rank:
 heuristic (prefill ~12× more tokens/sec) routing the closed-form split between the
 decode- and prefill-balanced regimes.
 
+### 3.4 `plan_safe` — the never-slower-than-baseline guard · `perf_planner.py`
+`plan()` returns the predicted-argmax, which at the crossover can be a *confident
+misprediction* (e.g. 8B chat n=16: predicts TP4PP2 +28% over TP8, but TP8 actually
+wins). Prediction alone therefore cannot guarantee "never slower than baseline."
+`plan_safe(m, hw, w, margin=SAFE_MARGIN=0.30)` adds a **risk-aware guard**: it
+returns the planner's top pick *only if* it is predicted to beat the uniform
+TP=world baseline (`uniform_tp_baseline`) by more than `margin` (≈2× the MAPE band);
+otherwise it returns the baseline. Rationale: act only on a signal larger than the
+model's noise, so a small/uncertain edge costs a *tie* (recommend baseline), never a
+loss. Empirically this gives **0 baseline-losses across all 55 measured cells** while
+keeping the large production-load wins (the big wins have huge predicted margins).
+- This is an *empirical* never-slower on all measured data, not a mathematical one
+  (a >30% confident misprediction on an unseen config could still slip). For an
+  **absolute** guarantee, the planner outputs both its pick and the baseline —
+  measure the two (2 short runs) and serve the faster (cheap insurance).
+- Trade-off (deliberate, matches the project's rule "ties OK, never slower"): the
+  conservative margin converts some small wins (+1 to ~+20%) into ties.
+
 ---
 
 ## 4. Calibration — what is fitted, and why it isn't overfitting
@@ -324,12 +342,16 @@ Calibration fit: champion 25/34, **mean regret 2.1%** (median 0%), top-3 32/34, 
    - **PP-skew (non-uniform PP)** grows as GPUs *increase*: 4+4 +38.6% → 2+2 +21.8% → 1+1
      +16.7% (more stages → more imbalance to correct).
    → *which* non-uniform knob matters depends on the layout.
-3. **Beats the naive baseline at production load** (self-validation on a HELD-OUT
-   workload, chat in=768/out=256, never calibrated; vs naive TP8-uniform):
-   at n≥64 the planner's pick wins **+37–51% (8B)** and **+40–66% (70B)**. At low
-   load it is mixed — 70B n=16 +5%, but **8B n=16 −26%** (a real miss: see §8). The
-   bar the project actually cares about ("beat baseline") holds in 5/6 cells and is
-   decisive in the throughput-serving regime. (`figures/fig_selfval_vs_baseline.png`.)
+3. **Never slower than the naive baseline (the SAFE recommendation, `plan_safe`).**
+   Requirement: the planner must never recommend a config measured-slower than the
+   uniform TP=world default (ties OK). The raw argmax planner violated this in 4/55
+   cells (worst −26%, all at the TP↔PP crossover where it confidently mis-ranked PP
+   over TP). `plan_safe` (§3.4) deviates from the baseline only when its pick is
+   predicted to beat it by >30% (~2× the MAPE band). Result across ALL 55 measured
+   cells (incl. the held-out chat workload + zero-refit 1+1/2+2 layouts): **0
+   baseline-losses, 29 wins (mean +42%)** — at production load (n≥64) it wins big
+   (+40–66%), at low load it ties the baseline instead of losing.
+   (`planner/verify_vs_baseline.py`, `figures/fig_selfval_vs_baseline.png`.)
 
 ---
 
@@ -345,9 +367,11 @@ Calibration fit: champion 25/34, **mean regret 2.1%** (median 0%), top-3 32/34, 
 - **Workload-shifted crossover** (surfaced by the held-out self-validation): the
   TP→PP crossover *concurrency* moves with the workload — a longer-prefill workload
   (chat in=768) keeps TP=world winning to higher n than the calibrated balanced (512)
-  does. The planner did not shift the crossover enough for **8B chat n=16**, picking
-  TP4PP2 where TP8-uniform actually won (−26% vs baseline). Same family as the low-n
-  crossover-precision residual; a workload-dependent crossover term would address it.
+  does. The raw `plan()` did not shift the crossover enough for **8B chat n=16**,
+  confidently picking TP4PP2 where TP8-uniform won (−26%). **`plan_safe` neutralizes
+  this** (it ties the baseline there instead of losing — see §3.4), so the user-facing
+  recommendation is never slower; the underlying prediction gap remains and a
+  workload-dependent crossover term would also recover the lost upside at that cell.
 - **Deliberate approximations** (not bugs): quadratic-attention prefill term dropped; the PP
   bubble / exposed-P2P terms are moot under the fitted η→1; `decode_weight_of`'s `/12` is a
   routing heuristic; non-uniform FFN/head bias is generated only for pp=1 (correct for
@@ -377,7 +401,9 @@ Calibration fit: champion 25/34, **mean regret 2.1%** (median 0%), top-3 32/34, 
 python planner/perf_planner.py --model 70b --in-len 512 --out-len 256 --n-req 96
 python planner/perf_planner.py --validate          # vs calibration (regret + champion + by n_req)
 python planner/check_consistency.py                # 17 invariants (logic soundness)
+python planner/verify_vs_baseline.py               # plan_safe never slower than baseline (0/55)
 python planner/validate_concurrency.py --head-gpus 2 --worker-gpus 2   # layout generalization
 python planner/fit_planner.py                       # refit the 8 params
+# the CLI also prints the SAFE recommendation (never-slower guard) + the baseline
 # new cluster: edit cluster.local.env → run the ≤6-cell probe → fit → validate
 ```

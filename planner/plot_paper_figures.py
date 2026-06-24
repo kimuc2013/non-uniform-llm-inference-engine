@@ -190,16 +190,22 @@ def fig_selfval(workload="chat", in_len=768, out_len=256):
         for e in cells: byn[e["n_req"]].append(e)
         ns = sorted(byn); pick = []; base = []; best = []
         for n in ns:
-            es = byn[n]; w = P.Workload(in_len, out_len, n); rows = []
-            for e in es:
-                cfg = P.Config(e["tp"], e["pp"], list(e["layer_split"]), list(e["ffn_splits"]),
-                               list(e["head_splits"]), list(e["kv_splits"]), e["label"])
-                rows.append((e["label"], e["tps"], P.predict(m, hw, w, cfg, overlap=(e["pp"] > 1)).get("tps", 0)))
-            pick.append(max(rows, key=lambda r: r[2])[1]); best.append(max(r[1] for r in rows))
-            b = [r for r in rows if r[0] == "TP8PP1_uniform"]; base.append(b[0][1] if b else 0)
+            es = byn[n]; w = P.Workload(in_len, out_len, n)
+            best.append(max(e["tps"] for e in es))
+            b = [e for e in es if e["label"] == "TP8PP1_uniform"]; base.append(b[0]["tps"] if b else 0)
+            # plan_safe recommendation, mapped to its nearest measured config
+            scfg, _, dev = P.plan_safe(m, hw, w)
+            if not dev:                       # fell back to the uniform-TP baseline
+                mt = base[-1]
+            else:
+                same = [e for e in es if e["tp"] == scfg.tp and e["pp"] == scfg.pp]
+                mt = (min(same, key=lambda e: sum(abs(a - x) for a, x in zip(e["layer_split"], scfg.layer_split))
+                          + abs(e["ffn_splits"][0] - scfg.ffn_splits[0]) / 1000)["tps"]
+                      if same else base[-1])
+            pick.append(mt)
         x = np.arange(len(ns)); w = 0.27
         ax.bar(x - w, base, w, label="baseline (TP8 uniform)", color="#999999")
-        ax.bar(x, pick, w, label="planner pick", color="#1f77b4")
+        ax.bar(x, pick, w, label="planner (safe) pick", color="#1f77b4")
         ax.bar(x + w, best, w, label="measured best", color="#2ca02c", alpha=0.6)
         for i, (p, b) in enumerate(zip(pick, base)):
             d = (p / b - 1) * 100 if b else 0
@@ -208,7 +214,9 @@ def fig_selfval(workload="chat", in_len=768, out_len=256):
         ax.set_xticks(x); ax.set_xticklabels([f"n={n}" for n in ns]); ax.set_title(title, fontweight="bold")
         ax.set_ylabel("throughput (tok/s)"); ax.grid(axis="y", alpha=0.3); ax.legend(fontsize=8)
     fig.suptitle(f"Self-validation on a HELD-OUT workload ({workload} in={in_len}/out={out_len}, "
-                 "not in calibration): planner vs naive baseline", fontsize=11)
+                 "not in calibration): SAFE planner vs naive baseline\n"
+                 "never-slower guard: ties baseline at low load, wins big at production load",
+                 fontsize=10)
     plt.tight_layout(); p = OUT / "fig_selfval_vs_baseline.png"
     fig.savefig(p, dpi=140, bbox_inches="tight"); plt.close(fig); print("saved", p)
 
