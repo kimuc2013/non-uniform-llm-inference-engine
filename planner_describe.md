@@ -273,7 +273,7 @@ keeping the large production-load wins (the big wins have huge predicted margins
 - **Generalization** (the decisive test): Mistral-123B pre-registered **3/3, regret 0%**
   (predicted *before* the sweep existed); zero-refit transfer to **1+1/2+2** layouts
   (regret 3.4/7.5%); LOMO held-out 70B **9/10**.
-- **Residuals were fixed by correcting the *structure***, not by adding fudge terms — and
+- **Gaps were fixed by correcting the *structure***, not by adding fudge terms — and
   each structural fix *improved generalization* (hierarchical AR, per-node NVLink/PCIe:
   champion 19→25, Spearman 0.72→0.83). A fudge factor would have helped the fit set but
   not the held-out predictions.
@@ -355,7 +355,7 @@ Calibration fit: champion 25/34, **mean regret 2.1%** (median 0%), top-3 32/34, 
 
 ---
 
-## 8. Known residuals (honest)
+## 8. Known corrections still needed (honest)
 
 - **Systematic TP-degree decode bias (the root of the baseline-losses).** Decomposing
   the predictions shows it is NOT noise: cross-node **TP=world (TP8) is under-predicted

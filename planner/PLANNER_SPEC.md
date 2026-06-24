@@ -349,7 +349,7 @@ linear KV term.
   over pp−1 (not pp) links.
 - *Per-node intra-AR (NVLink vs PCIe), 2026-06-23.* The Blackwell head has NVLink
   but the Ada worker is PCIe; a single `intra_ar` over-charged the Blackwell
-  stage's AllReduce and under-skewed PP layer allocation (the 8B-skew residual).
+  stage's AllReduce and under-skewed PP layer allocation (the 8B-skew correction).
   `HardwareSpec.intra_params(gpu)` now returns NVLink (≈800 GB/s, 4 µs, a fixed
   physics constant — NOT fitted, to avoid overfitting) for Blackwell and PCIe for
   Ada. This fixed the 4+4 8B layer-skew exactly and lifted **champion 19→25/34,
@@ -374,7 +374,7 @@ linear KV term.
   five audited bugs (embed charge, no-0-layer, no prefill sawtooth, full
   factorization, remainder conservation). A failure here is a logic bug, not a
   calibration gap — this is the "logically convincing" leg of the planner.
-- *Residual gaps (current):* (a) **opt30b TP8** (74% MAPE) — its no-GQA
+- *Open corrections (current):* (a) **opt30b TP8** (74% MAPE) — its no-GQA
   (n_kv=n_q=56) + tied-embed arch makes the TP8 KV term mis-scale; TP8 is not
   opt30b's champion at n≤100 so regret impact is bounded. (b) **8B layer-skew at
   mid-load** — FIXED by the per-node intra-AR (NVLink vs PCIe) above; TP4PP2_skew+8
@@ -393,14 +393,14 @@ linear KV term.
   homogeneous, but it would miss within-stage heterogeneity in an asymmetric
   placement. These are documented so "tested == the path the planner runs."
 
-**Calibration corrections applied (2026-06-13) and residual gaps:**
+**Calibration corrections applied (2026-06-13) and open corrections:**
 - *Prefill TFLOPS doubled* (Blackwell 289→578, Ada 183→366): the originals were
   back-derived under the additive wall model and read ~2× low; an independent
   free-param fit landed at 1.98× (= Ada bf16-acc peak). See hw_params note.
 - *Prefill AR overlap* `prefill_ar_overlap=0.8`: cross-node TP AllReduce of
   large prefill chunks is ~80% hidden under the GEMMs (async-TP /
   sequence-parallel): `t_stage_pre = compute + (1−0.8)·t_ar`.
-1. *Residual: TP=world prefill still under-predicted (~2.4×).* The above lifted
+1. *Correction needed: TP=world prefill still under-predicted (~2.4×).* The above lifted
    70B TP8 prefill from 388→540 tps (measured ~1369), but a single global ρ
    cannot fit both decode/balanced (which now want low ρ≈0.16 since prefill
    compute shrank) AND TP8 prefill_heavy (which behaves as if prefill is almost
@@ -491,7 +491,7 @@ Free parameters (everything else is datasheet/model arithmetic):
 | `α_AR, bw_AR` cross | cluster | §3.2 | probe 4 |
 | `p2p bw/lat` | link class | §4 send | probe 5 (or nccl-tests, free) |
 | `η, η_p2p` | engine | §4 overlap | probe 5 vs 6 |
-| `c_cpu, c_mb, c_layer` | engine | overheads | residuals of probes 1, 5, 6 |
+| `c_cpu, c_mb, c_layer` | engine | overheads | leftovers of probes 1, 5, 6 |
 
 Probe set (each = one standard perf-tool cell, CUDA graphs ON; ≤ 6 runs total):
 
@@ -515,7 +515,7 @@ P6  same as P5 with n_mb=2·pp (or PP=4 if world allows): separates c_mb from η
 ```
 
 Fitting is direct inversion (each probe isolates 1–2 parameters), no global
-least squares needed; remaining residual is folded into `c_cpu`. Acceptance
+least squares needed; remaining gap is folded into `c_cpu`. Acceptance
 gate before trusting the planner on a new cluster: predicted vs measured TPS
 within ±15% on all six probes, and rank-order correct on any two probes that
 differ in topology.
@@ -538,7 +538,7 @@ Verified numerically with current-cluster calibration
 
 Bonus consistency point for the paper: §3.3-A and §4's closed forms converge to
 the same ideal `work_r ∝ speed_r` roofline (biased TP8 0.072 vs skewed PP2
-58:22 → 0.068 ms/tok) — the *residual* difference between strategies is purely
+58:22 → 0.068 ms/tok) — the *leftover* difference between strategies is purely
 the comm structure (AR latency floor vs p2p/η) plus quantization granularity,
 which is exactly what the planner trades off.
 
