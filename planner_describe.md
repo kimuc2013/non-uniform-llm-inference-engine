@@ -303,15 +303,16 @@ n_req)` — **n_req in the key** so the batch axis is preserved.
 
 ## 6. Validation · `check_consistency.py`, `validate_concurrency.py`, `layout_summary.py`
 
-### 6.1 Self-consistency — 17 invariants (`check_consistency.py`)
+### 6.1 Self-consistency — 18 invariants (`check_consistency.py`)
 Properties the cost model *must* satisfy regardless of data — a failure is a **logic**
 bug, not a calibration gap. They cover: finite/positive outputs; TPS & decode-cycle
 monotone in n_req (incl. non-divisible n); TP8 throughput saturates; **homogeneous-cluster
 collapse** (non-uniform → uniform when there is no heterogeneity); **closed-form == brute-
 force optimum** (TP split, layer split); AR sanity (cross ≥ intra, monotone, continuous);
 feasibility monotone; bias favors the fast node; champion topology monotone in load;
-layouts 1+1/2+2/4+4 sane; + regression guards for the 5 audited bugs (embed charge,
-no-0-layer, no prefill sawtooth, full PP factorization, remainder conservation).
+layouts 1+1/2+2/4+4 sane; + regression guards for the audited bugs (embed charge,
+no-0-layer, no prefill sawtooth, full PP factorization, remainder conservation) and the
+never-slower guard (`plan_safe` never predicts below the uniform-TP baseline).
 
 ### 6.2 Accuracy metrics — **regret** is primary
 - **Regret** = `(best_measured − measured_TPS_of_predicted_pick) / best_measured`. This is
@@ -325,9 +326,24 @@ no-0-layer, no prefill sawtooth, full PP factorization, remainder conservation).
   from **PP-skew gain** (non-uniform PP).
 
 ### 6.3 Current numbers
-Calibration fit: champion 25/34, **mean regret 2.1%** (median 0%), top-3 32/34, Spearman
-0.83; TPS-MAPE 70B 11.5% / 8B 13.1% / 123B 17.4%. **Layout generalization (zero-refit):
-4+4 regret 0.2% · 2+2 7.5% · 1+1 3.4%.**
+Calibration fit (production workloads balanced/decode/prefill): champion 23/34,
+**mean regret 2.3%** (median 0%), Spearman 0.82; TPS-MAPE 70B 11.5% / 8B 13.1% /
+123B 14.7% / opt30b 29.5%. **Layout generalization (zero-refit): 4+4 regret 0.2%
+· 2+2 7.5% · 1+1 3.4%.**
+
+**Realistic operating point — the headline validation.** On the *balanced*
+workload (covers prefill+decode, not skewed), at *saturating concurrency*
+(n∈{32,64,96}, where the GPUs are fully utilized and the choice actually matters),
+across 8B/70B/123B × {1+1,2+2,4+4} = 18 cells:
+- At **4+4 (the production layout): regret = 0%** for every model and n (the
+  planner picks the measured champion exactly).
+- **`plan_safe` ≥ baseline in 18/18 cells** (never slower than naive uniform-TP),
+  mean **+23%** over baseline, **+40–78%** at n≥64.
+- The only soft spots are the *bias-degree near-ties* and one 2+2 crossover, all in
+  zero-refit 1+1/2+2 layouts; `plan_safe` ties the baseline there (never loses).
+This is the key result: production workloads (input-heavy, saturating load) land
+squarely in the planner's accurate regime — the crossover mispredictions discussed
+in §8 are confined to low-load / extreme-workload corners that production avoids.
 
 ---
 

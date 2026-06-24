@@ -13,9 +13,22 @@ hardware-dependent, and a small calibrated cost model can pick within a few
 percent of the measured optimum.
 
 ## Headline results
-- **Pre-registered planner validation on Mistral-Large-123B** (predicted *before*
-  any measurement, model ~1.8× the largest calibration model): **champion 3/3,
-  mean regret 0.0%, Spearman 0.84** vs measured. → `results/final/mistral_prereg_vs_measured.json`, `figures/fig_mistral123b_prereg.png`.
+- **Planner accuracy.** Closed-form cost model (calibrated once, ~9 effective
+  params): **mean regret 2.3%** on production workloads (median 0%, Spearman 0.82);
+  **18 self-consistency invariants** all hold. At the realistic operating point —
+  *balanced workload (covers prefill+decode), saturating concurrency (n≥32), 4+4
+  layout* — **regret is 0%** (picks the measured champion for every model).
+  → `planner_describe.md`, `planner/check_consistency.py`.
+- **Never slower than the naive baseline.** The `plan_safe` guard deviates from
+  uniform-TP only when confident; across **all 55 measured cells** (incl. a
+  held-out workload + zero-refit 1+1/2+2 layouts) it has **0 baseline-losses**, and
+  at saturating load it beats the naive default by **+23% mean (+40–78% at n≥64)**.
+  → `planner/verify_vs_baseline.py`.
+- **Generalizes without re-fitting.** Calibrated on 4+4, the cost model is
+  layout-parametric: zero-refit transfer to **2+2 (regret 7.5%) and 1+1 (3.4%)**,
+  covering the 1+1→4+4 target. Pre-registered on **Mistral-Large-123B** (predicted
+  *before* any measurement, ~1.8× the largest calibration model): **champion 3/3,
+  regret 0.0%, Spearman 0.84**. → `figures/fig_planner_validation.png`, `figures/fig_mistral123b_prereg.png`.
 - **PP overlap fork**: cross-node PP reaches **56–78%** overlap (stock vLLM 12–24%);
   70B 100-req **+16%** throughput. (M13 side-stream sampled-token broadcast = 2×.)
 - **Non-uniform TP**: helps **+7–13%** depending on regime; gain grows as TP degree
@@ -29,20 +42,26 @@ percent of the measured optimum.
 patches/
   vllm-0.22.0-hetero-tp-pp.patch   ★ all vLLM source changes (11 files, +1707/-90)
   APPLY.md                          how to re-apply on a fresh vLLM 0.22.0
+planner_describe.md                 ★ full pedagogical study guide (intuition + math + code refs)
 planner/                            ★ analytical planner (v2) + sweep + plots
-  perf_planner.py        closed-form TPS predict / plan() / --validate / --predict-mistral / CLI
-  fit_planner.py         fit free params to calibration_data.csv (robust, leave-one-model-out)
-  build_calibration.py   (re)build calibration_data.csv from results/
-  hetero_sweep.py        ★ generalized measurement sweep (any model × GPU layout)
+  perf_planner.py        closed-form TPS predict / plan() / plan_safe() / --validate / CLI
+  fit_planner.py         fit the ~9 effective params (robust loss over tps+itl+ttft, LOMO)
+  build_calibration.py   (re)build calibration_data.csv from results/ (additive accumulator)
+  hetero_sweep.py        ★ generalized measurement sweep (any model × GPU layout; --extra-workload)
   cluster_env.py         typed cluster config (reads cluster.local.env)
-  cluster_setup_4x4.py   idempotent Ray restart on both nodes
-  plot_*.py              matplotlib figures
+  cluster_setup_nxn.py   parameterized Ray (re)config for any N+N layout (1+1..4+4)
+  cluster_setup_4x4.py   idempotent Ray restart on both nodes (4+4)
+  check_consistency.py   18 self-consistency invariants (logic soundness, not calibration)
+  validate_concurrency.py  layout-parametric per-n_req champion/regret (zero-refit generalization)
+  verify_vs_baseline.py  plan_safe never-slower-than-baseline check
+  layout_summary.py      GPU-count axis: FFN-bias vs PP-skew gain
+  plot_*.py / plot_paper_figures.py   matplotlib figures
   *_pp_overlap_*.py       PP-overlap verification (nsys / torch-profiler)
-  PLANNER_SPEC.md        the full cost-model derivation (roofline + AR + overlap + memory)
-  HANDOFF.md             ★ detailed running status / next steps (read first to resume)
-  hw_params.json         calibrated effective HW params (per-GPU TFLOPS/BW, AR, overlap)
-  fitted_params.json     fitted engine params (ar, step_floor, overlap, prefill_overlap)
-  calibration_data.csv   211-row measured calibration (model × config × workload)
+  PLANNER_SPEC.md        the full cost-model derivation (roofline + hierarchical AR + overlap + memory)
+  HANDOFF.md             detailed running status / next steps
+  hw_params.json         fixed effective HW params (per-GPU TFLOPS/BW, NVLink/IB, prefill-AR-overlap)
+  fitted_params.json     fitted engine params (AR, step_floor, overlap, prefill_overlap, kv_bw_scale)
+  calibration_data.csv   measured calibration (4 models × config × workload × concurrency; n_req≤100)
   mistral_prediction.json / mistral_validation.json   pre-registration + comparison
   legacy_v1/             archived v1 cost-model planner + one-off diagnostics + old per-model sweeps
 launcher/                vLLM launcher wrapper + pp_overlap_config.py (PP-overlap auto-tuner)
