@@ -357,20 +357,26 @@ Calibration fit: champion 25/34, **mean regret 2.1%** (median 0%), top-3 32/34, 
 
 ## 8. Known corrections still needed (honest)
 
-- **Systematic TP-degree decode bias (the root of the baseline-losses).** Decomposing
-  the predictions shows it is NOT noise: cross-node **TP=world (TP8) is under-predicted
-  ~17%** (measured faster than predicted) and **TP4PP2-uniform is over-predicted ~34% at
-  high load**. Both push the predicted crossover toward PP, so the raw planner can pick
-  PP where the TP baseline actually wins. This is the structural parallelism signature
-  (TP pays AllReduce, PP pays bubble/P2P) showing up as a magnitude miscalibration by
-  TP degree. **Tested fix that did NOT work:** adding a fitted `decode_ar_overlap`
-  (async-TP hides part of the decode AR, which would lift TP8) — the global fit drove
-  it to 0 (decode AR is best modeled as fully exposed), so a simple AR-overcharge is
-  not the cause. A clean fix needs targeted **per-TP-degree decode microbenchmarks** to
-  isolate the TP8-vs-TP4 cost (the calibration sweep mixes them); per-TP-degree fudge
-  factors are deliberately avoided (overfitting). Until then, **`plan_safe` (§3.4) is the
-  safety net, not the fix** — it guarantees never-slower on all measured data while the
-  underlying TP-degree calibration is the real open item.
+- **Decode-curve shape + the TP↔PP crossover (the hard open correction).** A
+  decode microbenchmark (in=32/out=512, ITL vs batch, TP8 vs TP4PP2 on both models)
+  isolated the decode step time into intercept (batch-independent: weight-stream +
+  AR-floor + dispatch) and slope (batch-linear: KV-read + flops + AR-bandwidth). It
+  showed — for *both* configs — the model's intercept is over-charged and its slope
+  under-charged (the predicted decode curve is too flat), which under-predicts low
+  batch (hurts TP) and over-predicts high batch (flatters PP). Two structural levers
+  were tested honestly: (a) a fitted `decode_ar_overlap` (lift TP8) → the global fit
+  rejected it (→0; decode AR is fully exposed), so it is not an AR-overcharge; (b)
+  making KV-read bandwidth a fitted `kv_bw_scale` → it pinned to **0.32 (KV read ≈3×
+  slower than weight streaming — a real paged-attention effect)**, which steepened the
+  slope and improved absolute accuracy (opt30b MAPE 42→29.5%, 123B 17→14.7%, loss
+  0.34→0.31). **But neither fixed the crossover baseline-losses** (the slope is still
+  ~25–30% short at its bound and the intercept is still high), and production
+  champion/regret was ~flat (25→23/34, 2.1→2.3% — within noise). Honest conclusion:
+  the TP↔PP crossover precision is a genuine analytical-model limit that single-
+  parameter structural fixes do not resolve; `kv_bw_scale` is kept (physically correct,
+  better absolute accuracy) but **`plan_safe` (§3.4) remains the never-slower safety
+  net, not a model fix.** A proper crossover fix is the open research item (a better
+  TP-vs-PP decode-balance model, not a fudge factor).
 - **opt30b TP8** (74% MAPE): its no-GQA (`n_kv=n_q=56`) + tied-embed arch mis-scales the TP8
   KV term — same TP-degree family. TP8 isn't its champion at n≤100, so regret is bounded.
 - **Low-n FFN-bias degree**: at low load the planner picks `ffn_bias+50` where measured

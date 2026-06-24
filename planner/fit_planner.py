@@ -1,6 +1,6 @@
 """Fit the planner's free parameters to calibration_data.csv.
 
-Free parameters (8):
+Free parameters (9):
   ar_latency_us       cross-node per-hop AllReduce latency
   ar_bw_gbs           cross-node AR algorithm bandwidth
   intra_ar_latency_us intra-node per-hop latency
@@ -9,6 +9,8 @@ Free parameters (8):
   c_chunk_ms          per-prefill-chunk overhead
   overlap_eta         PP overlap efficiency
   prefill_overlap     ρ: prefill/decode resource-overlap fraction (wall blend)
+  kv_bw_scale         KV-read BW / weight BW (decmicro probe pins it ≈0.32: KV
+                      read ~3× slower than weight streaming)
 
 Fixed (anchored from physical derivation in hw_params.json, NOT fitted):
   GPU membw / tflops, p2p, mem capacities, prefill_ar_overlap, NVLink intra-AR.
@@ -35,12 +37,20 @@ N_REQ_MAX = 100  # hard operating rule: above this the Ada small-partition rank
                  # n=128 sweeps predate this rule; exclude them from the fit.
 
 
+# 'chat' is the HELD-OUT self-validation workload — never fit on it (keeps the
+# generalization test honest). 'decmicro' (in32/out512) is a decode-shape
+# calibration probe and IS used.
+HELD_OUT_WORKLOADS = {"chat"}
+
+
 def load_rows():
     rows = []
     for row in csv.DictReader(open(P.CALIB_CSV)):
         if row["model"] not in P.MODELS:
             continue
         if row.get("regime") == "stock":
+            continue
+        if row.get("workload") in HELD_OUT_WORKLOADS:
             continue
         if float(row["tps"]) <= 0:
             continue
@@ -73,6 +83,7 @@ def build_hw(x) -> P.HardwareSpec:
         c_chunk_ms=x[5],
         prefill_overlap=x[7],
         prefill_ar_overlap=base.get("prefill_ar_overlap", 0.0),
+        kv_bw_scale=x[8],
     )
 
 
@@ -133,6 +144,10 @@ def fit(rows):
         (0, 20),        # c_chunk_ms (physical per-chunk CPU dispatch, not a knob)
         (0.3, 1.0),     # overlap_eta
         (0.0, 1.0),     # prefill_overlap (ρ): prefill/decode resource overlap
+        (0.3, 1.5),     # kv_bw_scale: KV-read BW relative to weight BW. <1 ⇒ KV
+                        #   read slower than weights ⇒ steeper decode slope (the
+                        #   microbenchmark shows the per-request slope is under-
+                        #   charged ~25-40%).
     ]
     res = differential_evolution(
         eval_params, bounds, args=(rows,), maxiter=60, popsize=20,
@@ -149,7 +164,7 @@ def main():
     x = res.x
     names = ["ar_latency_us", "ar_bw_gbs", "intra_ar_latency_us",
              "step_floor_ms", "c_mb_ms", "c_chunk_ms", "overlap_eta",
-             "prefill_overlap"]
+             "prefill_overlap", "kv_bw_scale"]
     for n, v in zip(names, x):
         print(f"  {n:22s} = {v:8.2f}")
     print(f"  robust loss = {res.fun:.4f}")

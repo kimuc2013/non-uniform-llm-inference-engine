@@ -182,7 +182,7 @@ def load_hardware(path: Path = HW_PARAMS) -> HardwareSpec:
         fit = json.loads(fp.read_text()).get("fitted", {})
         for k in ("ar_latency_us", "ar_bw_gbs", "intra_ar_latency_us",
                   "overlap_eta", "step_floor_ms", "c_mb_ms", "c_chunk_ms",
-                  "prefill_overlap"):
+                  "prefill_overlap", "kv_bw_scale"):
             if k in fit:
                 kw[k] = fit[k]
     return HardwareSpec(**kw)
@@ -731,6 +731,8 @@ def validate(csv_path: Path = CALIB_CSV):
         regime = row.get("regime", "")
         # skip stock PP rows (planner models the overlap path); keep tp_only + overlap
         if regime == "stock":
+            continue
+        if row.get("workload") == "chat":      # held-out self-validation workload
             continue
         w = Workload(int(row["in_len"]), int(row["out_len"]), int(row["n_req"]))
         try:
