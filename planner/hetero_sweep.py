@@ -37,6 +37,12 @@ RAY_ADDR = CFG.ray_address
 # per-model default concurrency (matches the original per-model sweeps)
 DEFAULT_NREQ = {"8b": 96, "70b": 96, "qwen32b": 96, "opt30b": 64, "mistral123b": 96}
 # all ≤ 100: above it the Ada small-partition rank OOMs into KV thrashing (hard rule)
+# Per-model context cap (max_position_embeddings): OPT-30B only supports 2048.
+MODEL_MAX_LEN = {"opt30b": 2048}
+# Base (non-instruct) models lack a chat template; the perf driver uses the chat
+# endpoint, so give them a trivial pass-through template (content concatenation).
+NEEDS_CHAT_TEMPLATE = {"opt30b"}
+CHAT_TEMPLATE_FILE = REPO / "planner" / "base_chat_template.jinja"
 WORKLOAD_SHAPE = {"balanced": (512, 256), "decode_heavy": (128, 512), "prefill_heavy": (1024, 128)}
 
 
@@ -155,13 +161,16 @@ def _apply_pp_overlap_env(env, tp, pp, n_reqs, model):
           f"bq={cfg.bq} broadcast_stream={cfg.enable_broadcast_stream}", flush=True)
 
 
-def launch_vllm(model, port, tp, pp, env, log_path, max_num_seqs):
+def launch_vllm(model, port, tp, pp, env, log_path, max_num_seqs, max_model_len=4096,
+                chat_template=None):
     cmd = [PY, "-m", "vllm.entrypoints.openai.api_server", "--model", model,
            "--tensor-parallel-size", str(tp), "--pipeline-parallel-size", str(pp),
-           "--distributed-executor-backend", "ray", "--max-model-len", "4096",
+           "--distributed-executor-backend", "ray", "--max-model-len", str(max_model_len),
            "--max-num-seqs", str(max_num_seqs), "--gpu-memory-utilization", "0.85",
            "--dtype", "bfloat16", "--port", str(port), "--host", "0.0.0.0",
            "--enable-chunked-prefill", "--attention-backend", "FLASH_ATTN"]
+    if chat_template:
+        cmd += ["--chat-template", str(chat_template)]
     log_path.parent.mkdir(parents=True, exist_ok=True)
     fout = open(log_path, "w")
     return subprocess.Popen(cmd, env=env, stdout=fout, stderr=subprocess.STDOUT,
@@ -378,7 +387,9 @@ def main():
             env = _build_env(model, ls, ffn, head, kv)
             # PP overlap auto-tuner keyed on the largest concurrency in the sweep
             _apply_pp_overlap_env(env, tp, pp, max(n_req_list), model)
-            proc = launch_vllm(model, port, tp, pp, env, cdir/"vllm.log", max_num_seqs=max_seqs)
+            proc = launch_vllm(model, port, tp, pp, env, cdir/"vllm.log", max_num_seqs=max_seqs,
+                               max_model_len=min(4096, MODEL_MAX_LEN.get(args.model, 4096)),
+                               chat_template=(CHAT_TEMPLATE_FILE if args.model in NEEDS_CHAT_TEMPLATE else None))
             base = {"cell": cell, "label": label, "tp": tp, "pp": pp, "layer_split": ls,
                     "ffn_splits": ffn, "head_splits": head, "kv_splits": kv, "workload": wl,
                     "in_len": in_len, "out_len": out_len}

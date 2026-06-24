@@ -395,6 +395,15 @@ in §8 are confined to low-load / extreme-workload corners that production avoid
   TP-vs-PP decode-balance model, not a fudge factor).
 - **opt30b TP8** (74% MAPE): its no-GQA (`n_kv=n_q=56`) + tied-embed arch mis-scales the TP8
   KV term — same TP-degree family. TP8 isn't its champion at n≤100, so regret is bounded.
+  (At the saturating operating point opt30b still beats baseline +38–73%, fig below.)
+- **Qwen3-32B is the one weak model** (uplift fig). Measured Qwen3-32B is anomalously slow
+  (max ~1.5k tok/s at 4+4 vs OPT-30B's ~2.7k, despite similar size) — likely QK-norm /
+  64-layer architecture overhead the roofline does not model. The planner over-predicts it
+  and `plan_safe` can deviate into a baseline-loss (4+4 n=64 −7%, 2+2 n=64 −29%). Adding
+  Qwen3-32B concurrency to the *fit* makes it worse (MAPE 46%, and it drags 8B/70B from
+  ~13% to ~17%), so it is kept OUT of the fit and flagged as the open arch-modeling case.
+  The other 4 models (Llama-8B/70B, OPT-30B, Mistral-123B) win +38–78% at saturating load.
+  → `figures/planner_uplift/planner_vs_baseline_uplift_{4x4,2x2,1x1}.png`.
 - **Low-n FFN-bias degree**: at low load the planner picks `ffn_bias+50` where measured
   prefers `+25` (regret <9%, a flat-curve near-tie where the bias barely matters). Membw-
   driven, not addressed by the AR fix.
