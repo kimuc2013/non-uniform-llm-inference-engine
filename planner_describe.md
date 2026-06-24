@@ -357,8 +357,22 @@ Calibration fit: champion 25/34, **mean regret 2.1%** (median 0%), top-3 32/34, 
 
 ## 8. Known residuals (honest)
 
+- **Systematic TP-degree decode bias (the root of the baseline-losses).** Decomposing
+  the predictions shows it is NOT noise: cross-node **TP=world (TP8) is under-predicted
+  ~17%** (measured faster than predicted) and **TP4PP2-uniform is over-predicted ~34% at
+  high load**. Both push the predicted crossover toward PP, so the raw planner can pick
+  PP where the TP baseline actually wins. This is the structural parallelism signature
+  (TP pays AllReduce, PP pays bubble/P2P) showing up as a magnitude miscalibration by
+  TP degree. **Tested fix that did NOT work:** adding a fitted `decode_ar_overlap`
+  (async-TP hides part of the decode AR, which would lift TP8) — the global fit drove
+  it to 0 (decode AR is best modeled as fully exposed), so a simple AR-overcharge is
+  not the cause. A clean fix needs targeted **per-TP-degree decode microbenchmarks** to
+  isolate the TP8-vs-TP4 cost (the calibration sweep mixes them); per-TP-degree fudge
+  factors are deliberately avoided (overfitting). Until then, **`plan_safe` (§3.4) is the
+  safety net, not the fix** — it guarantees never-slower on all measured data while the
+  underlying TP-degree calibration is the real open item.
 - **opt30b TP8** (74% MAPE): its no-GQA (`n_kv=n_q=56`) + tied-embed arch mis-scales the TP8
-  KV term. TP8 isn't its champion at n≤100, so regret impact is bounded.
+  KV term — same TP-degree family. TP8 isn't its champion at n≤100, so regret is bounded.
 - **Low-n FFN-bias degree**: at low load the planner picks `ffn_bias+50` where measured
   prefers `+25` (regret <9%, a flat-curve near-tie where the bias barely matters). Membw-
   driven, not addressed by the AR fix.
