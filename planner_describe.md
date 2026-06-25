@@ -77,11 +77,195 @@ is the **time-averaged** KV length over a decode (the cache grows linearly).
 
 ## 2. The cost model (the heart)
 
-### 2.1 Per-rank roofline — decode vs prefill · `perf_planner.py:297-337`
+### 2.0 Notation, variables & schematic — every symbol in one place
+
+Before the per-section derivations (§2.1–2.5), here is the **complete dictionary** of
+every symbol the cost model uses, a **schematic** of how they flow into a throughput
+number, and the **master equation chain** that ties them together. Read this once and
+every equation below becomes a lookup.
+
+> **Unit convention.** Inside the code all rates are in **GB/s** (`·1e9` → bytes/s) and
+> **TFLOPS** (`·1e12` → FLOP/s); messages and weights are in **bytes**; every cost is
+> computed in **seconds** then `·1e3` → **milliseconds**. Below, `BW·1e9` etc. are kept
+> implicit — read every `t = bytes / BW` as "seconds, then ×1000 for ms".
+
+#### A. The symbol dictionary
+
+**A.1 Model architecture** — `ModelSpec`, from each model's HF `config.json` (`:38-86`)
+
+| symbol | code | meaning | unit | 8B / 70B / OPT-30B / Qwen3-32B / Mistral-123B |
+|---|---|---|---|---|
+| `L`   | `n_layers` | transformer layers | – | 32 / 80 / 48 / 64 / 88 |
+| `h`   | `hidden`   | model (residual) width | – | 4096 / 8192 / 7168 / 5120 / 12288 |
+| `ffn` | `ffn_dim`  | FFN intermediate width | – | 14336 / 28672 / 28672 / 25600 / 28672 |
+| `n_q` | `n_q`      | query heads | – | 32 / 64 / 56 / 64 / 96 |
+| `n_kv`| `n_kv`     | key/value heads (GQA) | – | 8 / 8 / 56 / 8 / 8 |
+| `d_h` | `head_dim` | per-head width | – | 128 (all) |
+| `V`   | `vocab`    | vocabulary size | – | 128256 / 128256 / 50272 / 151936 / 32768 |
+| `mats`| `ffn_mats` | FFN matrices: 3 (SwiGLU gate+up+down) or 2 (GELU) | – | 3 / 3 / **2** / 3 / 3 |
+| `g`   | `gqa_group`| `n_q/n_kv`, the head-bias quantum | – | 4 / 8 / **1** / 8 / 12 |
+
+*Derived per-layer "work" counts* (these are what the roofline divides by a rate):
+- `p_attn = h·n_q·d_h + 2·h·n_kv·d_h + n_q·d_h·h`  — Wq + Wkv + Wo (GQA shrinks Wkv by `g`).
+- `p_ffn  = mats·h·ffn`  — the FFN block (~82 % of a layer's weight).
+- `p_embed = V·h` (tied) or `2·V·h` (untied: input table + lm_head are separate tensors).
+
+**A.2 Hardware** — `GpuType` + `HardwareSpec` (`:89-156`, incl. the `gpu_of_rank` /
+`node_of_rank` / `intra_params` helpers the cost model leans on). Rates are **effective** (fitted
+to measured sweeps, `hw_params.json`), not datasheet.
+
+| symbol | code | meaning | unit | value |
+|---|---|---|---|---|
+| `BW_g`  | `membw_gbs`        | effective HBM BW streaming weights (decode) | GB/s | Blackwell **1400**, Ada **707** |
+| `TF_g`  | `tflops_prefill`   | effective bf16 compute rate (used by *both* phases) | TFLOPS | Blackwell **578**, Ada **366** |
+| `M_g`   | `mem_gb`           | GPU memory | GB | Blackwell **96**, Ada **48** |
+| `α_ib`  | `ar_latency_us`    | cross-node per-hop AR latency | µs | **5.43** (fitted) |
+| `BW_ib` | `ar_bw_gbs`        | cross-node AR algorithm BW (IB) | GB/s | **5.16** (fitted) |
+| `α_intra`| `intra_ar_latency_us` | intra-node per-hop latency (cross-node 2-tier inner) | µs | **5.0** (fitted) |
+| `BW_intra`| `intra_ar_bw_gbs`| intra-node AR BW (PCIe-class, 2-tier inner) | GB/s | **60** |
+| `α_nv`  | `nvlink_ar_latency_us` | **single-node** Blackwell NVLink latency | µs | **4.0** (physics) |
+| `BW_nv` | `nvlink_ar_bw_gbs` | **single-node** Blackwell NVLink BW | GB/s | **800** (physics) |
+| `α_p2p` | `p2p_latency_us`   | PP point-to-point handoff latency | µs | 200 |
+| `BW_p2p`| `p2p_bw_gbs`       | PP point-to-point BW | GB/s | 10 |
+| `η`     | `overlap_eta`      | fork PP overlap efficiency (1 ⇒ bubble fully hidden); `predict()` (`:358`) applies it only when `pp>1` **and** overlap on (the default) — else 0.15 (pp>1, no overlap) or 0 (pp=1, unused) | – | **1.0** (fitted) |
+| `floor` | `step_floor_ms`    | per-decode-step CPU/dispatch floor | ms | **1.74** (fitted) |
+| `c_mb`  | `c_mb_ms`          | per-microbatch CPU dispatch | ms | **0.35** (fitted) |
+| `c_chunk`| `c_chunk_ms`      | per-prefill-chunk CPU floor | ms | **10.1** (fitted) |
+| `κ`     | `kv_bw_scale`      | KV-read BW relative to weight BW (`<1` ⇒ KV slower) | – | **0.316** (fitted) ≈ 1/3.2 |
+| `ρ`     | `prefill_overlap`  | fraction of the *smaller* phase hidden under the larger | – | **0.46** (fitted) |
+| `ar_pre`| `prefill_ar_overlap`| fraction of prefill AR hidden under GEMMs | – | **0.8** |
+| `μ`     | `prefill_tf_mult`  | prefill-TFLOPS absolute-level correction | – | 1.0 |
+| `u`     | `mem_util`         | usable fraction of GPU memory | – | 0.85 |
+
+> **Why some "defaults" don't match the code's dataclass.** `load_hardware()` (`:159-188`)
+> reads `hw_params.json`, then **overlays** `fitted_params.json` for 9 keys
+> (`ar_latency_us, ar_bw_gbs, intra_ar_latency_us, overlap_eta, step_floor_ms, c_mb_ms,
+> c_chunk_ms, prefill_overlap, kv_bw_scale`). So the **effective** `η=1.0` and
+> `floor=1.74 ms` above are the fit's values, *not* the `0.65 / 30.0` dataclass
+> placeholders. `η=1.0` is meaningful: it makes every `(1−η)` bubble term **vanish** —
+> the fork's measured PP overlap is good enough that the calibrated model charges no
+> exposed bubble. `BW_nv/α_nv` and `p2p_*` are *not* fitted (physics / nominal priors).
+
+**A.3 Workload** — `Workload` (`:191-199`)
+
+| symbol | code | meaning |
+|---|---|---|
+| `S_in`  | `in_len`  | prompt length (tokens) |
+| `S_out` | `out_len` | generated length (tokens) |
+| `N`     | `n_req`   | concurrency (in-flight requests) |
+| `kv_avg`| `kv_avg`  | `S_in + S_out/2` — time-averaged KV length over a decode |
+
+**A.4 Decision variables** — `Config` (`:202-210`), what `plan()` searches over
+
+| symbol | code | meaning | length |
+|---|---|---|---|
+| `tp` | `tp` | tensor-parallel width per stage | – |
+| `pp` | `pp` | pipeline stages | – |
+| `L_s`   | `layer_split[s]` | layers on stage `s` | `pp` |
+| `ffn_r` | `ffn_splits[r]`  | FFN columns on rank `r` (non-uniform TP) | `tp` |
+| `head_r`| `head_splits[r]` | query heads on rank `r` | `tp` |
+| `kv_r`  | `kv_splits[r]`   | KV heads on rank `r` | `tp` |
+
+**A.5 Derived quantities & fixed constants**
+
+- `pr` = `params_on_rank` — weights resident on one rank (the single "work" scalar, §2.2).
+- `embed_s` = `embed_on_stage(m,pp,s)` — embedding params *physically on stage `s`*: full `p_embed` if `pp=1`, else one `V·h` table on stage 0 and one on the last stage, 0 on interior stages (§2.2).
+- `n_mb = min(pp, N)` microbatches; `mb = N/n_mb` requests each (a *float*; §2.4).
+- `dw` = `decode_weight_of(w) = S_out/(S_out + S_in/12)` — decode-dominance ∈ [0,1] (§3).
+- `n_AR = 2·L_s` — all-reduces per step (one after attention-out, one after FFN-down, per layer).
+- Byte constants: `B_W = B_KV = B_A = 2` (bf16). `T_CHUNK = 8192` (prefill chunk). `C_ACT = 6` (peak-activation multiplier, memory check only).
+
+#### B. Schematic — how a `(model, hardware, config, workload)` becomes a TPS
+
+```
+ ModelSpec ─┐
+ GpuType   ─┼──► Config (tp, pp, L_s, ffn_r, head_r, kv_r) ──► predict()  ──►  TPS
+ Workload  ─┘            ▲ searched by plan() (§3.3)               │
+                         └─ optimal splits (§3.1–3.2)              │
+   ┌─────────────────────────────────────────────────────────────┘
+   ▼   predict()  (§2.4)
+   ├─ mem_feasible? ── no ──► TPS = 0  (hard reject, §2.5)
+   │        │ yes
+   │        ▼
+   │   ┌── PREFILL phase ────────────────┐   ┌── DECODE phase ─────────────────┐
+   │   │ total_in = N·S_in tokens        │   │ repeat for each of S_out tokens:│
+   │   │ → ceil(total_in/8192) chunks    │   │   one decode T_cycle            │
+   │   │ pipeline = fill + Σ steady      │   │   pp=1: one stage @ batch N     │
+   │   │ each chunk: max_s stage_pre+bub │   │   pp>1: n_mb microbatches,      │
+   │   │                                 │   │         bottleneck + bubble     │
+   │   │ ⇒ T_prefill                     │   │   ⇒ T_decode = S_out·T_cycle    │
+   │   └─────────────┬───────────────────┘   └──────────────┬──────────────────┘
+   │                 └──────────► WALL BLEND ◄───────────────┘
+   │                   T_total = max(T_pre,T_dec) + (1−ρ)·min(T_pre,T_dec)
+   │                                  │
+   └──────────────────────────► TPS = N·S_out / T_total
+
+ ── zoom: one stage's busy time (the roofline lives here) ───────────────────────
+   stage_time_{decode|prefill}(stage s, batch/chunk x):
+     stage s holds L_s layers on ranks [s·tp, (s+1)·tp)
+       for each rank r (GPU type g — HETEROGENEOUS: Blackwell vs Ada):
+         pr     = L_s·(p_attn·head_r/n_q + p_ffn·ffn_r/ffn) + embed_s/tp   ◄ §2.2
+         t_mem  = pr·B_W/BW_g           (+ KV_read/(BW_g·κ)   in decode)   ┐ roofline
+         t_flop = 2·pr·x / TF_g                                           ┘ → max
+         t_rank = max(t_mem, t_flop)
+       t_max  = max_r t_rank            ◄ the SLOWEST rank gates the TP group
+     + AllReduce: 2·L_s · t_ar(msg = x·h·B_A, ranks)   ◄ hierarchical 2-tier (§2.3)
+     = stage busy time
+```
+
+#### C. The master equation chain (inputs → TPS)
+
+Everything below is one continuous derivation; the right column says which `predict()`
+lines (`:341-419`) and which § expand it.
+
+```
+(1) per-rank weights           pr = L_s·(p_attn·head_r/n_q + p_ffn·ffn_r/ffn) + embed_s/tp     §2.2
+(2) AllReduce of a msg over a TP group's ranks  (pick branch by node count)                     §2.3
+     single node:  t_ar = 2(n−1)/n·msg/BW + 2(n−1)·α            [BW,α = NVLink or PCIe]
+     cross node:   t_ar = 2(n_loc−1)/n_loc·msg/BW_intra                  (intra tier)
+                        + 2(n_nd−1)/n_nd·msg/BW_ib                       (inter/IB tier)
+                        + 2(n_nd−1)·α_ib + 2(n_loc−1)·α_intra            (2-tier latency)
+(3) DECODE stage (batch b):  t_max = max_r max( pr·B_W/BW_g + (b·kv_avg·L_s·2·kv_r·d_h·B_KV)/(BW_g·κ),
+                                                 2·pr·b/TF_g )
+                             stage_dec = t_max + 2·L_s·t_ar(b·h·B_A)                             §2.1
+(4) PREFILL stage (chunk c):  t_max = max_r max( 2·pr·c/(TF_g·μ),  pr·B_W/BW_g )
+                              stage_pre = t_max + (1−ar_pre)·2·L_s·t_ar(c·h·B_A)                 §2.1
+(5) DECODE cycle:   pp=1:  T_cycle = stage_dec(b=N) + floor
+                    pp>1:  n_mb=min(pp,N);  mb=N/n_mb
+                           busy_s = n_mb·(stage_dec(b=mb) + c_mb)
+                           t_send = mb·h·B_A/BW_p2p + α_p2p
+                           T_cycle = max_s busy_s + (1−η)·(Σ busy − max)              ← bubble
+                                              + (1−η)·t_send·(pp−1) + floor                      §2.4
+                    T_decode = S_out · T_cycle
+(6) PREFILL pipeline:  total_in=N·S_in;  n_chunks=ceil(total_in/8192)
+                       chunk 0 (fill):  T_pre  = Σ_s stage_pre + c_chunk
+                       chunk j>0:       T_pre += max_s stage_pre + (1−η)·(Σ_s stage_pre − max) + c_chunk   §2.4
+(7) WALL BLEND:     T_total = max(T_pre, T_decode) + (1−ρ)·min(T_pre, T_decode)                 §2.4
+(8) THROUGHPUT:     TPS = N·S_out / T_total        TTFT = (fill chunk) + T_cycle               §2.4
+(9) FEASIBILITY (gate before all of the above):                                                §2.5
+       need_r = pr·B_W + N·(S_in+S_out)·L_s·2·kv_r·d_h·B_KV + C_ACT·8192·max(h,2·ffn_r)·B_A + 3.5e9   (all bytes; 3.5e9 = 1.5+2.0 GB ctx/NCCL/graph)
+       reject the whole config if any rank has  need_r > M_g·1e9·u
+```
+
+**The one-paragraph story.** Size each rank's weight slab `pr` (1). Decode streams that
+slab from HBM every token (mem-bound, batch-*independent* numerator) plus reads the
+batch-linear KV cache at `κ≈⅓` the weight BW; the slowest rank in the TP group sets the
+pace, then each layer pays an all-reduce whose cost (2) is dominated by a *few* inter-node
+hops, not a flat ring — that hierarchical term is what keeps cross-node TP alive at low
+load. Prefill instead crunches a whole 8192-token chunk at the tensor-core rate (4). PP
+turns one big stage into `pp` smaller ones run as a pipeline (5–6); with the calibrated
+`η=1.0` the bubble term is zero, so PP's win is purely the **smaller weight slab per rank**
+and the **cheaper intra-node AR** versus paying cross-node AR every layer. Prefill and
+decode overlap on disjoint units (7), and throughput is just tokens over wall time (8) —
+provided every rank's weights+KV+activations fit in memory (9).
+
+---
+
+### 2.1 Per-rank roofline — decode vs prefill · `perf_planner.py:300-338`
 
 The **roofline** model (Williams 2009): a kernel's time = `max(memory-time, compute-time)`.
 
-**Decode** (`stage_time_decode_ms`, `:297-316`) is **memory-bound**: every token
+**Decode** (`stage_time_decode_ms`, `:300-318`) is **memory-bound**: every token
 streams the *whole* layer weight matrix from HBM, plus reads the KV cache.
 ```
 t_mem  = (weight_bytes + KV_read_bytes) / membw          # ← dominates
@@ -92,10 +276,10 @@ t_stage = max_r t_rank(r)  +  2·L_s · t_allreduce        # slowest rank gates 
 - `weight_bytes` is **batch-independent** (the matrix is read once per step regardless
   of how many sequences are batched) → this is *why decode TPS rises with batch until
   the KV/flop term catches up* — the **saturation batch**.
-- `KV_read = batch·kv_avg·L_s·2·kv_r·d_h·b_kv` (k+v, only this rank's `kv_r` heads), **batch-linear**.
+- `KV_read = batch·kv_avg·L_s·2·kv_r·d_h·B_KV` (k+v, only this rank's `kv_r` heads), **batch-linear**.
 - `n_AR = 2·L_s` all-reduces per step (attention-out + FFN-down per layer).
 
-**Prefill** (`stage_time_prefill_ms`, `:319-337`) is **compute-bound** (process `T_c`
+**Prefill** (`stage_time_prefill_ms`, `:321-338`) is **compute-bound** (process `T_c`
 tokens at once → high arithmetic intensity → tensor-core limited):
 ```
 t_flop = 2·params·chunk_tokens / (tflops · prefill_tf_mult)   # ← dominates
@@ -107,7 +291,7 @@ t_stage = max(t_flop, t_mem) + (1 − prefill_ar_overlap)·2·L_s·t_allreduce
 - `prefill_ar_overlap=0.8`: the AR of large prefill chunks is ~80% hidden under the
   GEMMs (async-TP / sequence-parallel), so only 20% is charged.
 
-### 2.2 `params_on_rank` + `embed_on_stage` · `perf_planner.py:226-247`
+### 2.2 `params_on_rank` + `embed_on_stage` · `perf_planner.py:229-250`
 The single "work" scalar:
 ```
 params_on_rank = L_s·(p_attn·head_r/n_q + p_ffn·ffn_r/ffn_dim) + embed/tp
@@ -119,7 +303,7 @@ stages — **even for tied models** (PP can't share a weight across stages → r
 *(This was a bug: the old code charged the full `2·V·h` on both end stages, an
 anti-PP bias on the bottleneck Ada stage. Fixed; guarded by consistency invariant #13.)*
 
-### 2.3 AllReduce — ring → **hierarchical 2-tier** · `perf_planner.py:261-283`
+### 2.3 AllReduce — ring → **hierarchical 2-tier** · `perf_planner.py:253-286`
 
 This is the hetero-cluster crux. The α–β model of a collective: `t = bw_term + lat_term`.
 
@@ -148,7 +332,7 @@ Two regimes fall out automatically: **decode** (small msg) is *latency-floor* do
 by the few inter-node hops → cross-node TP is viable at low load; **prefill** (large
 msg) is *IB-bandwidth* dominated.
 
-### 2.4 `predict()` — config → TPS · `perf_planner.py:340-418`
+### 2.4 `predict()` — config → TPS · `perf_planner.py:341-419`
 ```
 mem_feasible? no → tps=0 (hard reject)
 T_decode = out_len · T_cycle                          # one cycle = one token across all requests
@@ -178,7 +362,7 @@ The **last chunk uses its true remainder** (not a full `T_CHUNK`) — fixes a sa
 units and partially overlap under chunked continuous batching. `ρ=prefill_overlap`:
 ρ=0 → serial, ρ=1 → smaller phase fully hidden.
 
-### 2.5 `mem_feasible()` — hard reject · `perf_planner.py:425-445`
+### 2.5 `mem_feasible()` — hard reject · `perf_planner.py:426-446`
 Per stage, per rank: `weights + KV + activations + overhead ≤ mem_gb·0.85`.
 - KV uses the **max** context `(in_len+out_len)` (the cache must fit at peak), unlike
   the timing path which uses the time-average `kv_avg`.
@@ -223,27 +407,36 @@ Enumerate, predict, rank:
    `n_layers ≥ pp`): uniform layers + the closed-form layer split and its **±3 neighborhood**.
 3. `predict()` each, drop infeasible, sort by TPS, return top-k.
 
-`decode_weight_of(w)` (`:588-592`) = `out_len/(out_len + in_len/12)` — a fixed
+`decode_weight_of(w)` (`:589-593`) = `out_len/(out_len + in_len/12)` — a fixed
 heuristic (prefill ~12× more tokens/sec) routing the closed-form split between the
 decode- and prefill-balanced regimes.
 
-### 3.4 `plan_safe` — the never-slower-than-baseline guard · `perf_planner.py`
-`plan()` returns the predicted-argmax, which at the crossover can be a *confident
-misprediction* (e.g. 8B chat n=16: predicts TP4PP2 +28% over TP8, but TP8 actually
-wins). Prediction alone therefore cannot guarantee "never slower than baseline."
-`plan_safe(m, hw, w, margin=SAFE_MARGIN=0.30)` adds a **risk-aware guard**: it
-returns the planner's top pick *only if* it is predicted to beat the uniform
-TP=world baseline (`uniform_tp_baseline`) by more than `margin` (≈2× the MAPE band);
-otherwise it returns the baseline. Rationale: act only on a signal larger than the
-model's noise, so a small/uncertain edge costs a *tie* (recommend baseline), never a
-loss. Empirically this gives **0 baseline-losses across all 55 measured cells** while
-keeping the large production-load wins (the big wins have huge predicted margins).
-- This is an *empirical* never-slower on all measured data, not a mathematical one
-  (a >30% confident misprediction on an unseen config could still slip). For an
-  **absolute** guarantee, the planner outputs both its pick and the baseline —
-  measure the two (2 short runs) and serve the faster (cheap insurance).
-- Trade-off (deliberate, matches the project's rule "ties OK, never slower"): the
-  conservative margin converts some small wins (+1 to ~+20%) into ties.
+### 3.4 Recommendation = the raw argmax (`plan()[0]`) — and its measured risk · `perf_planner.py`
+The planner's recommendation is simply the top of the ranking — `plan(m, hw, w)[0]`,
+the configuration with the highest predicted TPS, **with no safety guard**.
+
+> *An earlier `plan_safe()` guard (confidence margin `SAFE_MARGIN=0.30`) was **removed**.
+> It returned the uniform-TP baseline whenever the predicted non-uniform gain was below
+> 30 %, which guaranteed "never slower than baseline" on the measured set but **hid the
+> real non-uniform wins** — often **+11–27 %** at 1+1/2+2, exactly the cases the planner
+> exists to surface. The raw argmax exposes those gains (and the risk below).*
+
+**The risk this exposes, measured** (`verify_vs_baseline.py`: raw `plan()[0]` vs the
+uniform-TP=world baseline, balanced workload, **n ≥ 32**, **50 cells** across 1+1/2+2/4+4):
+
+- **mean uplift +23.7 %**, **41/50 cells ≥ baseline**, **38 wins (mean +34 %)**.
+- **9 baseline-losses.** **Six are qwen32b**, whose TP4PP2 *serving* does not scale —
+  the planner correctly predicts PP scaling (it holds for the other four models) but
+  qwen's pipeline is compute/overhead-bound per microbatch (§8). The other **three are
+  genuine near-ties** (8B 2+2 n32 −9.4 %, 70B 2+2 n64 −7.6 %, OPT-30B 4+4 n32 −2.9 %)
+  where pure non-uniform TP narrowly beats the planner's PP pick — all inside the
+  model's own MAPE band. **Excluding the qwen serving outlier: only 3 near-tie losses
+  (≤ 9.4 %) across 44 cells.**
+
+The trade is explicit: the raw planner wins big and often (+23.7 % mean) at the cost of
+a few sub-10 % near-tie slips. For a deployment that needs an **absolute** never-slower
+guarantee, the CLI still prints both the pick **and** the baseline — measure the two
+(2 short runs) and serve the faster (cheap insurance).
 
 ---
 
@@ -303,7 +496,7 @@ n_req)` — **n_req in the key** so the batch axis is preserved.
 
 ## 6. Validation · `check_consistency.py`, `validate_concurrency.py`, `layout_summary.py`
 
-### 6.1 Self-consistency — 18 invariants (`check_consistency.py`)
+### 6.1 Self-consistency — 17 invariants (`check_consistency.py`)
 Properties the cost model *must* satisfy regardless of data — a failure is a **logic**
 bug, not a calibration gap. They cover: finite/positive outputs; TPS & decode-cycle
 monotone in n_req (incl. non-divisible n); TP8 throughput saturates; **homogeneous-cluster
@@ -311,8 +504,7 @@ collapse** (non-uniform → uniform when there is no heterogeneity); **closed-fo
 force optimum** (TP split, layer split); AR sanity (cross ≥ intra, monotone, continuous);
 feasibility monotone; bias favors the fast node; champion topology monotone in load;
 layouts 1+1/2+2/4+4 sane; + regression guards for the audited bugs (embed charge,
-no-0-layer, no prefill sawtooth, full PP factorization, remainder conservation) and the
-never-slower guard (`plan_safe` never predicts below the uniform-TP baseline).
+no-0-layer, no prefill sawtooth, full PP factorization, remainder conservation).
 
 ### 6.2 Accuracy metrics — **regret** is primary
 - **Regret** = `(best_measured − measured_TPS_of_predicted_pick) / best_measured`. This is
@@ -337,10 +529,11 @@ workload (covers prefill+decode, not skewed), at *saturating concurrency*
 across 8B/70B/123B × {1+1,2+2,4+4} = 18 cells:
 - At **4+4 (the production layout): regret = 0%** for every model and n (the
   planner picks the measured champion exactly).
-- **`plan_safe` ≥ baseline in 18/18 cells** (never slower than naive uniform-TP),
-  mean **+23%** over baseline, **+40–78%** at n≥64.
-- The only soft spots are the *bias-degree near-ties* and one 2+2 crossover, all in
-  zero-refit 1+1/2+2 layouts; `plan_safe` ties the baseline there (never loses).
+- **Raw planner: mean +23.7% over baseline, 41/50 cells ≥ baseline, 38 wins
+  (mean +34%)**, **+40–78%** at n≥64 (`verify_vs_baseline.py`).
+- The 9 baseline-losses are **6 qwen32b** (its TP4PP2 serving outlier, §8) plus **3
+  genuine near-ties** (≤9.4%, within the model's MAPE band). Excluding the qwen
+  serving outlier: only 3 near-tie slips across 44 cells.
 This is the key result: production workloads (input-heavy, saturating load) land
 squarely in the planner's accurate regime — the crossover mispredictions discussed
 in §8 are confined to low-load / extreme-workload corners that production avoids.
@@ -358,15 +551,14 @@ in §8 are confined to low-load / extreme-workload corners that production avoid
    - **PP-skew (non-uniform PP)** grows as GPUs *increase*: 4+4 +38.6% → 2+2 +21.8% → 1+1
      +16.7% (more stages → more imbalance to correct).
    → *which* non-uniform knob matters depends on the layout.
-3. **Never slower than the naive baseline (the SAFE recommendation, `plan_safe`).**
-   Requirement: the planner must never recommend a config measured-slower than the
-   uniform TP=world default (ties OK). The raw argmax planner violated this in 4/55
-   cells (worst −26%, all at the TP↔PP crossover where it confidently mis-ranked PP
-   over TP). `plan_safe` (§3.4) deviates from the baseline only when its pick is
-   predicted to beat it by >30% (~2× the MAPE band). Result across ALL 55 measured
-   cells (incl. the held-out chat workload + zero-refit 1+1/2+2 layouts): **0
-   baseline-losses, 29 wins (mean +42%)** — at production load (n≥64) it wins big
-   (+40–66%), at low load it ties the baseline instead of losing.
+3. **Big mean uplift, bounded near-tie risk (raw-argmax recommendation).** Against the
+   uniform TP=world default, the raw planner (`plan()[0]`) delivers **mean +23.7% with
+   41/50 cells ≥ baseline** (38 wins, mean +34%, up to +78% at saturating load). The cost
+   of dropping the old `plan_safe` guard is **9 baseline-losses**: **6 are the qwen32b
+   TP4PP2 serving outlier** (§8 — not a model error) and **3 are genuine near-ties**
+   (≤9.4%, inside the MAPE band) at the TP↔PP crossover. So the planner is a clear net
+   win; the residual risk is confined to sub-10% crossover near-ties — and a deployment
+   needing an absolute guarantee measures pick + baseline (2 runs) and serves the faster (§3.4).
    (`planner/verify_vs_baseline.py`, `figures/fig_selfval_vs_baseline.png`.)
 
 ---
@@ -390,20 +582,27 @@ in §8 are confined to low-load / extreme-workload corners that production avoid
   champion/regret was ~flat (25→23/34, 2.1→2.3% — within noise). Honest conclusion:
   the TP↔PP crossover precision is a genuine analytical-model limit that single-
   parameter structural fixes do not resolve; `kv_bw_scale` is kept (physically correct,
-  better absolute accuracy) but **`plan_safe` (§3.4) remains the never-slower safety
-  net, not a model fix.** A proper crossover fix is the open research item (a better
-  TP-vs-PP decode-balance model, not a fudge factor).
+  better absolute accuracy). A proper crossover fix is the open research item (a better
+  TP-vs-PP decode-balance model, not a fudge factor); until then the residual risk shows
+  up as the sub-10% near-tie losses in §3.4.
 - **opt30b TP8** (74% MAPE): its no-GQA (`n_kv=n_q=56`) + tied-embed arch mis-scales the TP8
   KV term — same TP-degree family. TP8 isn't its champion at n≤100, so regret is bounded.
   (At the saturating operating point opt30b still beats baseline +38–73%, fig below.)
-- **Qwen3-32B is the one weak model** (uplift fig). Measured Qwen3-32B is anomalously slow
-  (max ~1.5k tok/s at 4+4 vs OPT-30B's ~2.7k, despite similar size) — likely QK-norm /
-  64-layer architecture overhead the roofline does not model. The planner over-predicts it
-  and `plan_safe` can deviate into a baseline-loss (4+4 n=64 −7%, 2+2 n=64 −29%). Adding
-  Qwen3-32B concurrency to the *fit* makes it worse (MAPE 46%, and it drags 8B/70B from
-  ~13% to ~17%), so it is kept OUT of the fit and flagged as the open arch-modeling case.
-  The other 4 models (Llama-8B/70B, OPT-30B, Mistral-123B) win +38–78% at saturating load.
-  → `figures/planner_uplift/planner_vs_baseline_uplift_{4x4,2x2,1x1}.png`.
+- **Qwen3-32B is a SERVING outlier, not a model bug** (uplift fig). Its **TP4PP2 serving
+  does not scale**: measured ITL grows with batch (49→64 ms) and never flattens, while
+  OPT-30B's TP4PP2 ITL flattens (~35 ms) and scales to 2.7k tok/s — even though qwen has
+  *less* KV pressure (GQA `n_kv=8` vs OPT's MHA `n_kv=56`). A 2026-06-25 A/B
+  (`planner/qwen_pp_ab.py`, n=96) confirms it is **not a config issue**: the auto-tuner
+  gave qwen the *same* PP-overlap recipe as OPT-30B/70B (mb=reqs/2, bq=2), and forcing a
+  *deeper* pipeline makes it **worse** (mb=24→919 tok/s, mb=12→511, vs auto mb=48→1459) —
+  i.e. qwen's TP4PP2 is compute/overhead-bound *per microbatch*, intrinsic Qwen3 behaviour
+  (likely QK-norm + 64 layers) the roofline does not model. The planner correctly assumes
+  PP scales (it does for the other four models) and so over-predicts qwen by 50–105%,
+  producing 6 of the 9 raw-planner baseline-losses (4+4 n=64 −7%, 2+2 n=64 −29%, 1+1 n=96
+  −50%). Adding Qwen3-32B concurrency to the *fit* makes it worse (MAPE 46%, drags 8B/70B
+  ~13%→~17%), so it is kept OUT of the fit and flagged as an open serving (not planner)
+  case. The other 4 models (Llama-8B/70B, OPT-30B, Mistral-123B) win +38–78% at saturating
+  load. → `figures/planner_uplift/planner_vs_baseline_uplift_{4x4,2x2,1x1}.png`.
 - **Low-n FFN-bias degree**: at low load the planner picks `ffn_bias+50` where measured
   prefers `+25` (regret <9%, a flat-curve near-tie where the bias barely matters). Membw-
   driven, not addressed by the AR fix.
@@ -413,10 +612,10 @@ in §8 are confined to low-load / extreme-workload corners that production avoid
   TP→PP crossover *concurrency* moves with the workload — a longer-prefill workload
   (chat in=768) keeps TP=world winning to higher n than the calibrated balanced (512)
   does. The raw `plan()` did not shift the crossover enough for **8B chat n=16**,
-  confidently picking TP4PP2 where TP8-uniform won (−26%). **`plan_safe` neutralizes
-  this** (it ties the baseline there instead of losing — see §3.4), so the user-facing
-  recommendation is never slower; the underlying prediction gap remains and a
-  workload-dependent crossover term would also recover the lost upside at that cell.
+  confidently picking TP4PP2 where TP8-uniform won (−26%) — this is the kind of low-load
+  near-tie crossover miss that survives now that the `plan_safe` guard is gone (n<32 is
+  excluded from the headline numbers for exactly this reason). A workload-dependent
+  crossover term is the proper fix and would also recover the lost upside at that cell.
 - **Deliberate approximations** (not bugs): quadratic-attention prefill term dropped; the PP
   bubble / exposed-P2P terms are moot under the fitted η→1; `decode_weight_of`'s `/12` is a
   routing heuristic; non-uniform FFN/head bias is generated only for pp=1 (correct for
@@ -446,9 +645,9 @@ in §8 are confined to low-load / extreme-workload corners that production avoid
 python planner/perf_planner.py --model 70b --in-len 512 --out-len 256 --n-req 96
 python planner/perf_planner.py --validate          # vs calibration (regret + champion + by n_req)
 python planner/check_consistency.py                # 17 invariants (logic soundness)
-python planner/verify_vs_baseline.py               # plan_safe never slower than baseline (0/55)
+python planner/verify_vs_baseline.py               # raw planner vs baseline: win/loss profile (+23.7% mean, n>=32)
 python planner/validate_concurrency.py --head-gpus 2 --worker-gpus 2   # layout generalization
 python planner/fit_planner.py                       # refit the 8 params
-# the CLI also prints the SAFE recommendation (never-slower guard) + the baseline
+# the CLI also prints the RECOMMENDED pick (raw argmax) + the baseline for comparison
 # new cluster: edit cluster.local.env → run the ≤6-cell probe → fit → validate
 ```

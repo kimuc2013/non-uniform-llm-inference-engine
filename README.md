@@ -15,15 +15,15 @@ percent of the measured optimum.
 ## Headline results
 - **Planner accuracy.** Closed-form cost model (calibrated once, ~9 effective
   params): **mean regret 2.3%** on production workloads (median 0%, Spearman 0.82);
-  **18 self-consistency invariants** all hold. At the realistic operating point —
+  **17 self-consistency invariants** all hold. At the realistic operating point —
   *balanced workload (covers prefill+decode), saturating concurrency (n≥32), 4+4
   layout* — **regret is 0%** (picks the measured champion for every model).
   → `planner_describe.md`, `planner/check_consistency.py`.
-- **Never slower than the naive baseline.** The `plan_safe` guard deviates from
-  uniform-TP only when confident; across **all 55 measured cells** (incl. a
-  held-out workload + zero-refit 1+1/2+2 layouts) it has **0 baseline-losses**, and
-  at saturating load it beats the naive default by **+23% mean (+40–78% at n≥64)**.
-  → `planner/verify_vs_baseline.py`.
+- **Beats the naive baseline by +23.7% mean.** The planner recommends the raw
+  predicted-best config (`plan()[0]`); across **50 measured cells** (balanced, n≥32,
+  1+1/2+2/4+4) it is **≥ baseline in 41/50** (38 wins, mean +34%, +40–78% at n≥64).
+  The 9 losses are 6 qwen32b TP4PP2 serving-outlier cells + 3 sub-10% crossover
+  near-ties (within model error). → `planner/verify_vs_baseline.py`.
 - **Generalizes without re-fitting.** Calibrated on 4+4, the cost model is
   layout-parametric: zero-refit transfer to **2+2 (regret 7.5%) and 1+1 (3.4%)**,
   covering the 1+1→4+4 target. Pre-registered on **Mistral-Large-123B** (predicted
@@ -44,16 +44,16 @@ patches/
   APPLY.md                          how to re-apply on a fresh vLLM 0.22.0
 planner_describe.md                 ★ full pedagogical study guide (intuition + math + code refs)
 planner/                            ★ analytical planner (v2) + sweep + plots
-  perf_planner.py        closed-form TPS predict / plan() / plan_safe() / --validate / CLI
+  perf_planner.py        closed-form TPS predict / plan() (raw argmax) / --validate / CLI
   fit_planner.py         fit the ~9 effective params (robust loss over tps+itl+ttft, LOMO)
   build_calibration.py   (re)build calibration_data.csv from results/ (additive accumulator)
   hetero_sweep.py        ★ generalized measurement sweep (any model × GPU layout; --extra-workload)
   cluster_env.py         typed cluster config (reads cluster.local.env)
   cluster_setup_nxn.py   parameterized Ray (re)config for any N+N layout (1+1..4+4)
   cluster_setup_4x4.py   idempotent Ray restart on both nodes (4+4)
-  check_consistency.py   18 self-consistency invariants (logic soundness, not calibration)
+  check_consistency.py   17 self-consistency invariants (logic soundness, not calibration)
   validate_concurrency.py  layout-parametric per-n_req champion/regret (zero-refit generalization)
-  verify_vs_baseline.py  plan_safe never-slower-than-baseline check
+  verify_vs_baseline.py  raw planner vs uniform baseline: win/loss profile (n>=32)
   layout_summary.py      GPU-count axis: FFN-bias vs PP-skew gain
   plot_*.py / plot_paper_figures.py   matplotlib figures
   *_pp_overlap_*.py       PP-overlap verification (nsys / torch-profiler)

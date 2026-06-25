@@ -193,11 +193,12 @@ def fig_selfval(workload="chat", in_len=768, out_len=256):
             es = byn[n]; w = P.Workload(in_len, out_len, n)
             best.append(max(e["tps"] for e in es))
             b = [e for e in es if e["label"] == "TP8PP1_uniform"]; base.append(b[0]["tps"] if b else 0)
-            # plan_safe recommendation, mapped to its nearest measured config
-            scfg, _, dev = P.plan_safe(m, hw, w)
-            if not dev:                       # fell back to the uniform-TP baseline
+            # RAW planner top-1 pick (no safety guard), mapped to its nearest measured config
+            ranked = P.plan(m, hw, w, top_k=1)
+            if not ranked:
                 mt = base[-1]
             else:
+                scfg = ranked[0][1]
                 same = [e for e in es if e["tp"] == scfg.tp and e["pp"] == scfg.pp]
                 mt = (min(same, key=lambda e: sum(abs(a - x) for a, x in zip(e["layer_split"], scfg.layer_split))
                           + abs(e["ffn_splits"][0] - scfg.ffn_splits[0]) / 1000)["tps"]
@@ -205,7 +206,7 @@ def fig_selfval(workload="chat", in_len=768, out_len=256):
             pick.append(mt)
         x = np.arange(len(ns)); w = 0.27
         ax.bar(x - w, base, w, label="baseline (TP8 uniform)", color="#999999")
-        ax.bar(x, pick, w, label="planner (safe) pick", color="#1f77b4")
+        ax.bar(x, pick, w, label="planner pick", color="#1f77b4")
         ax.bar(x + w, best, w, label="measured best", color="#2ca02c", alpha=0.6)
         for i, (p, b) in enumerate(zip(pick, base)):
             d = (p / b - 1) * 100 if b else 0

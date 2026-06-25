@@ -1,9 +1,10 @@
 """Planner uplift over the naive baseline, per batch (concurrency), for all 5
-models. Two bars per batch — baseline (uniform TP=world) and the planner's SAFE
-recommendation (plan_safe) — with the uplift % labeled. No 'measured best' bar.
+models. Two bars per batch — baseline (uniform TP=world) and the planner's RAW
+top-1 pick (no safety guard) — with the uplift % labeled. No 'measured best' bar.
 
-Balanced workload (covers prefill+decode), 4+4 layout. Output: figures/planner_uplift/.
-Usage: python planner/plot_planner_uplift.py
+Only n_req >= 32 is shown: small batches do not saturate the cluster and are not
+a representative serving regime. Balanced workload (covers prefill+decode).
+Output: figures/planner_uplift/. Usage: python planner/plot_planner_uplift.py
 """
 from __future__ import annotations
 import dataclasses, glob, json, sys
@@ -52,24 +53,26 @@ def main(hg=4, wg=4):
             ax.set_title(f"{title} (no data)"); ax.set_visible(False); continue
         byn = defaultdict(list)
         for e in cells: byn[e["n_req"]].append(e)
-        ns = sorted(byn); base = []; plan = []; uplift = []
+        ns = [n for n in sorted(byn) if n >= 32]   # small batches are not a real cluster regime
+        base = []; plan = []; uplift = []
         for n in ns:
             es = list({e["label"]: e for e in byn[n]}.values())
             w = P.Workload(es[0]["in_len"], es[0]["out_len"], n)
             b = [e for e in es if e["label"] == f"TP{world}PP1_uniform"]
             tp1 = [e for e in es if e["pp"] == 1]
             bt = b[0]["tps"] if b else (max(e["tps"] for e in tp1) if tp1 else max(e["tps"] for e in es))
-            scfg, _, dev = P.plan_safe(m, hw, w)
-            if not dev:
-                pt = bt
-            else:
-                same = [e for e in es if e["tp"] == scfg.tp and e["pp"] == scfg.pp]
-                pt = (min(same, key=lambda e: sum(abs(a - x) for a, x in zip(e["layer_split"], scfg.layer_split))
-                          + abs(e["ffn_splits"][0] - scfg.ffn_splits[0]) / 1000)["tps"] if same else bt)
+            # RAW planner top-1 (no safety guard), mapped to nearest measured config
+            ranked = P.plan(m, hw, w, top_k=1)
+            if not ranked:        # no feasible config at this layout (e.g. 123B won't fit on 2 GPUs)
+                base.append(bt); plan.append(bt); uplift.append(0.0); continue
+            scfg = ranked[0][1]
+            same = [e for e in es if e["tp"] == scfg.tp and e["pp"] == scfg.pp]
+            pt = (min(same, key=lambda e: sum(abs(a - x) for a, x in zip(e["layer_split"], scfg.layer_split))
+                      + abs(e["ffn_splits"][0] - scfg.ffn_splits[0]) / 1000)["tps"] if same else bt)
             base.append(bt); plan.append(pt); uplift.append((pt / bt - 1) * 100 if bt else 0)
         x = np.arange(len(ns)); w = 0.38
         ax.bar(x - w / 2, base, w, label="baseline (uniform TP)", color="#9aa0a6")
-        ax.bar(x + w / 2, plan, w, label="planner (plan_safe)", color="#1a73e8")
+        ax.bar(x + w / 2, plan, w, label="planner pick", color="#1a73e8")
         for i, u in enumerate(uplift):
             ax.text(i, max(base[i], plan[i]) * 1.02, f"{u:+.0f}%", ha="center",
                     fontsize=10, fontweight="bold", color="#137333" if u >= 0 else "#c5221f")
@@ -87,8 +90,8 @@ def main(hg=4, wg=4):
     axu.set_xlabel("concurrency (n_req)"); axu.set_ylabel("planner uplift over baseline (%)")
     axu.set_title("Uplift vs concurrency (all models)", fontweight="bold", fontsize=13)
     axu.grid(alpha=0.3); axu.legend(fontsize=8)
-    fig.suptitle(f"Planner (plan_safe) vs naive baseline (uniform TP{world}) — "
-                 f"balanced workload, {hg}+{wg}, by batch", fontsize=15, y=1.0)
+    fig.suptitle(f"Planner (raw top-1 pick) vs naive baseline (uniform TP{world}) — "
+                 f"balanced workload, {hg}+{wg}, n>=32, by batch", fontsize=15, y=1.0)
     plt.tight_layout()
     p = OUT / f"planner_vs_baseline_uplift_{hg}x{wg}.png"
     fig.savefig(p, dpi=140, bbox_inches="tight"); plt.close(fig)

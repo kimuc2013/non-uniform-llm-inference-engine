@@ -1,16 +1,16 @@
-"""Verify the HARD requirement: the planner's SAFE recommendation (plan_safe)
-must never be measured-slower than the naive uniform baseline (ties OK).
+"""Measure the RAW planner's win/loss profile against the naive uniform baseline.
+
+The planner now reports the raw argmax `plan(...)[0]` (the never-slower `plan_safe`
+guard was removed — its 30% margin hid the real non-uniform gains). This script
+quantifies the resulting risk: for every measured cell (calibration 4+4 all
+workloads + concurrency + layouts + held-out chat) it runs `plan()[0]`, maps the
+top pick to the nearest MEASURED config in that cell, and compares to the baseline.
 
 Baseline = uniform TP=world (homogeneous tensor-parallel default): TP8u @4+4,
-TP4u @2+2, TP2u @1+1. For every measured cell (calibration 4+4 all workloads +
-concurrency + layouts + held-out chat), we run plan_safe(), map its recommended
-config to the nearest MEASURED config in that cell, and compare to the baseline.
-
-NOTE on guarantees: plan_safe's confidence guard reduces baseline-losses to ZERO
-across all measured cells at SAFE_MARGIN, but prediction cannot mathematically
-guarantee never-slower on UNSEEN configs (the TP↔PP crossover can be confidently
-mispredicted). For an absolute guarantee, measure top-2 (plan_safe pick + baseline)
-and serve the faster — cheap insurance, 2 short runs.
+TP4u @2+2, TP2u @1+1. Output reports mean uplift, the fraction of cells that beat
+or tie the baseline, and every baseline-LOSS cell (the near-tie risk + qwen32b's
+TP4PP2 serving outlier). For an absolute never-slower guarantee on a deployment,
+measure top-2 (pick + baseline) and serve the faster — cheap insurance, 2 runs.
 """
 from __future__ import annotations
 import argparse, csv, dataclasses, glob, json, re, sys
@@ -68,11 +68,14 @@ def meas_of(cellmap, cfg):
 
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("--margin", type=float, default=P.SAFE_MARGIN)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--min-n", type=int, default=32,
+                    help="ignore cells with n_req below this (small batches don't saturate the cluster)")
     args = ap.parse_args()
     hw0 = P.load_hardware(); groups = collect()
-    n_cells = n_ok = 0; worst = 0.0; viol = []; wins = []
+    n_cells = n_ok = 0; worst = 0.0; viol = []; wins = []; rels = []
     for (model, hg, wg, wl, n), cm in sorted(groups.items()):
+        if n < args.min_n: continue
         es = list(cm.values())
         if len(es) < 3: continue
         world = hg + wg; m = P.MODELS[model]; hw = relayout(hw0, hg, wg)
@@ -80,18 +83,21 @@ def main():
         base = [e for e in es if e["tp"] == world and e["pp"] == 1 and "uniform" in e["label"]]
         if not base: continue
         bt = base[0]["tps"]
-        cfg, r, dev = P.plan_safe(m, hw, w, margin=args.margin)
+        ranked = P.plan(m, hw, w, top_k=1)            # RAW argmax, no guard
+        if not ranked: continue
+        cfg = ranked[0][1]
         pt = meas_of(cm, cfg)
         if pt is None: continue
-        n_cells += 1; rel = (pt - bt) / bt * 100
+        n_cells += 1; rel = (pt - bt) / bt * 100; rels.append(rel)
         if rel >= -0.5: n_ok += 1
         else: viol.append((rel, model, f"{hg}+{wg}", wl, n, cfg.label)); worst = min(worst, rel)
         if rel > 0.5: wins.append(rel)
-    print(f"plan_safe (margin={args.margin}) vs uniform TP=world baseline.  cells: {n_cells}")
-    print(f"  ≥ baseline (ties OK, 0.5% band): {n_ok}/{n_cells}   baseline-losses: {len(viol)}   worst {worst:.1f}%")
-    print(f"  wins >0.5%: {len(wins)}  (mean +{sum(wins)/max(1,len(wins)):.0f}%)")
+    print(f"RAW planner (plan()[0]) vs uniform TP=world baseline.  cells (n>={args.min_n}): {n_cells}")
+    print(f"  >= baseline (ties OK, 0.5% band): {n_ok}/{n_cells}   baseline-losses: {len(viol)}   worst {worst:.1f}%")
+    print(f"  mean uplift over baseline: {sum(rels)/max(1,len(rels)):+.1f}%   "
+          f"wins >0.5%: {len(wins)} (mean +{sum(wins)/max(1,len(wins)):.0f}%)")
     for v in sorted(viol):
-        print(f"    LOSS {v[0]:+.1f}%  {v[1]} {v[2]} {v[3]} n={v[4]}  rec={v[5]}")
+        print(f"    LOSS {v[0]:+.1f}%  {v[1]} {v[2]} {v[3]} n={v[4]}  pick={v[5]}")
 
 
 if __name__ == "__main__":

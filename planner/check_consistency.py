@@ -24,7 +24,6 @@ Invariants
 15 prefill_no_sawtooth  T_prefill has no chunk-boundary jump (partial last chunk)
 16 factorization_complete  plan() enumerates non-power-of-2 PP (3+3 pp∈{3,6})
 17 tps_mono_odd  TPS monotone in n_req at non-divisible points (no dropped remainder)
-18 safe_not_below_baseline  plan_safe never predicts below the uniform-TP baseline
 """
 from __future__ import annotations
 import dataclasses, itertools, math, sys
@@ -377,29 +376,6 @@ def c16_factorization_complete():
     return v
 
 
-def c18_safe_not_below_baseline():
-    """plan_safe must NEVER recommend a config it predicts slower than the uniform
-    TP=world baseline (the never-slower guard, in prediction space): by construction
-    it returns the baseline or a config predicted to beat it, so predicted(pick) ≥
-    predicted(baseline) for every (model, layout, workload, n_req)."""
-    v = []
-    for n in (1, 2, 4):
-        hw = relayout(HW, n)
-        for mk in MODELS:
-            m = P.MODELS[mk]
-            base = P.uniform_tp_baseline(m, hw)
-            if base is None: continue
-            for wn in WLS:
-                for nr in (8, 32, 96):
-                    w = wl(wn, nr)
-                    br = P.predict(m, hw, w, base, overlap=False)
-                    bt = br["tps"] if br.get("feasible") else 0.0
-                    cfg, r, dev = P.plan_safe(m, hw, w)
-                    if r and r.get("tps", 0) < bt * 0.999:
-                        v.append(f"{n}+{n} {mk} {wn} n{nr}: safe pred {r.get('tps',0):.0f} < base {bt:.0f}")
-    return v
-
-
 def c17_tps_mono_odd():
     """TPS monotone in n_req even at non-divisible points (n%pp≠0): the decode
     model must not drop the remainder. (Audit: mb=n_req//pp dropped n%pp.)"""
@@ -430,7 +406,6 @@ CHECKS = [
     ("15 prefill_no_sawtooth", c15_prefill_no_sawtooth),
     ("16 factorization_complete", c16_factorization_complete),
     ("17 tps_mono_odd", c17_tps_mono_odd),
-    ("18 safe_not_below_baseline", c18_safe_not_below_baseline),
 ]
 
 

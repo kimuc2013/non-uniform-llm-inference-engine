@@ -672,37 +672,14 @@ def uniform_tp_baseline(m: ModelSpec, hw: HardwareSpec) -> Config:
                   label=f"TP{world} uniform (baseline)")
 
 
-SAFE_MARGIN = 0.30   # empirical never-slower threshold: at this margin plan_safe has
-                     # 0 baseline-losses across all 55 measured cells (incl. a held-out
-                     # workload + zero-refit 1+1/2+2 layouts). ~2× the MAPE band, to
-                     # cover confident crossover mispredictions. Ties traded for safety.
-
-
-def plan_safe(m: ModelSpec, hw: HardwareSpec, w: Workload,
-              margin: float = SAFE_MARGIN, overlap: bool = True):
-    """Risk-aware recommendation with a NEVER-SLOWER-THAN-BASELINE guard.
-
-    Returns (cfg, predicted, deviated): the planner only deviates from the naive
-    uniform-TP=world baseline when its best pick is predicted to beat the baseline
-    by more than `margin` (~the MAPE band). Otherwise it returns the baseline.
-    Rationale: prediction error at the TP↔PP crossover can be confident and wrong;
-    acting only on a signal larger than the noise band means small mispredictions
-    cost a tie (recommend baseline), never a loss. Validated: 0 baseline-losses
-    across all 55 measured cells (incl. a held-out workload + zero-refit layouts);
-    for an ABSOLUTE guarantee on unseen configs, measure top-2 (pick + baseline)
-    and run the faster.
-    """
-    base = uniform_tp_baseline(m, hw)
-    scored = plan(m, hw, w, top_k=10, overlap=overlap)
-    if base is None:                      # no uniform-TP=world baseline (odd world)
-        return (scored[0][1], scored[0][2], True) if scored else (None, None, False)
-    base_r = predict(m, hw, w, base, overlap=False)
-    base_tps = base_r["tps"] if base_r.get("feasible") else 0.0
-    if scored:
-        top_tps, top_cfg, top_r = scored[0]
-        if base_tps > 0 and top_tps > base_tps * (1 + margin):
-            return top_cfg, top_r, True   # confident enough to deviate
-    return base, base_r, False            # fall back to the safe default
+# NOTE: the old `plan_safe()` never-slower guard (SAFE_MARGIN=0.30) was REMOVED.
+# Its 30% confidence margin returned the baseline whenever the predicted non-uniform
+# gain was smaller than the margin — which HID the real non-uniform wins (often
+# 11-27% at 1+1/2+2). The planner now reports the RAW argmax `plan(...)[0]`. The
+# residual risk is a handful of near-tie cells (<~10% over baseline, inside the
+# model's own error band) plus qwen32b's TP4PP2 serving outlier; see
+# planner_describe.md §3.4 / §8. `uniform_tp_baseline` is kept as the comparison
+# reference (used by figures and verify_vs_baseline.py).
 
 
 # ----------------------------------------------------------------------------
@@ -895,15 +872,20 @@ def main():
     print(f"{'rank':4s} {'config':52s} {'pred TPS':>9s} {'TTFT ms':>9s}")
     for i, (tps, cfg, r) in enumerate(ranked):
         print(f"{i+1:4d} {cfg.label + ' ' + cfg.short():52s} {tps:9.0f} {r['ttft_ms']:9.0f}")
-    # SAFE recommendation (never-slower-than-baseline guard)
-    scfg, sr, dev = plan_safe(m, hw, w)
+    # recommended pick = top of the ranking (raw argmax; no safety guard)
     base = uniform_tp_baseline(m, hw)
-    note = (f"deviates from baseline (predicted >{int(SAFE_MARGIN*100)}% over it)"
-            if dev else "= uniform-TP baseline (not confident enough to deviate)")
-    print(f"\nSAFE recommendation (margin {SAFE_MARGIN:.0%}): {scfg.label} {scfg.short()}"
-          f"  pred {sr.get('tps',0):.0f} tok/s  [{note}]")
-    if base is not None:
-        print(f"  baseline (uniform TP{hw.world}): measure both & serve faster for an absolute never-slower guarantee.")
+    if ranked:
+        top_tps, top_cfg, _ = ranked[0]
+        line = f"\nRECOMMENDED: {top_cfg.label} {top_cfg.short()}  pred {top_tps:.0f} tok/s"
+        if base is not None:
+            br = predict(m, hw, w, base, overlap=False)
+            bt = br["tps"] if br.get("feasible") else 0.0
+            if bt > 0:
+                line += f"  ({(top_tps/bt - 1) * 100:+.0f}% vs uniform-TP{hw.world} baseline {bt:.0f})"
+        print(line)
+        if base is not None:
+            print("  near-ties (<~10% over baseline) are within model error — "
+                  "measure the pick + baseline and serve the faster if it matters.")
 
 
 if __name__ == "__main__":
