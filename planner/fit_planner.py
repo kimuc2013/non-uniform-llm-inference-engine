@@ -86,7 +86,8 @@ def build_hw(x) -> P.HardwareSpec:
         c_chunk_ms=x[5],
         prefill_overlap=x[7],
         prefill_ar_overlap=base.get("prefill_ar_overlap", 0.0),
-        kv_bw_scale=x[8],
+        kv_bw_scale=1.0,            # FIXED: measured ~1.0 (kv_bw_microbench.py), not fitted
+        decode_ar_overlap=x[8],     # the real decode comm/compute-overlap knob (replaces kappa)
     )
 
 
@@ -147,10 +148,10 @@ def fit(rows):
         (0, 20),        # c_chunk_ms (physical per-chunk CPU dispatch, not a knob)
         (0.3, 1.0),     # overlap_eta
         (0.0, 1.0),     # prefill_overlap (ρ): prefill/decode resource overlap
-        (0.3, 1.5),     # kv_bw_scale: KV-read BW relative to weight BW. <1 ⇒ KV
-                        #   read slower than weights ⇒ steeper decode slope (the
-                        #   microbenchmark shows the per-request slope is under-
-                        #   charged ~25-40%).
+        (0.0, 1.0),     # decode_ar_overlap: comm/compute overlap of the per-step
+                        #   decode AllReduce with the layer GEMVs. Replaces the
+                        #   misattributed kv_bw_scale (KV measured at peak BW); this
+                        #   is the physical decode batch-slope knob (async-TP overlap).
     ]
     res = differential_evolution(
         eval_params, bounds, args=(rows,), maxiter=60, popsize=20,
@@ -167,7 +168,7 @@ def main():
     x = res.x
     names = ["ar_latency_us", "ar_bw_gbs", "intra_ar_latency_us",
              "step_floor_ms", "c_mb_ms", "c_chunk_ms", "overlap_eta",
-             "prefill_overlap", "kv_bw_scale"]
+             "prefill_overlap", "decode_ar_overlap"]
     for n, v in zip(names, x):
         print(f"  {n:22s} = {v:8.2f}")
     print(f"  robust loss = {res.fun:.4f}")

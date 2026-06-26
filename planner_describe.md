@@ -131,7 +131,8 @@ to measured sweeps, `hw_params.json`), not datasheet.
 | `floor` | `step_floor_ms`    | per-decode-step CPU/dispatch floor | ms | **1.74** (fitted) |
 | `c_mb`  | `c_mb_ms`          | per-microbatch CPU dispatch | ms | **0.35** (fitted) |
 | `c_chunk`| `c_chunk_ms`      | per-prefill-chunk CPU floor | ms | **10.1** (fitted) |
-| `κ`     | `kv_bw_scale`      | KV-read BW relative to weight BW (`<1` ⇒ KV slower) | – | **0.316** (fitted) ≈ 1/3.2 |
+| `κ`     | `kv_bw_scale`      | KV-read BW relative to weight BW — **MEASURED ≈ 1.0** (`kv_bw_microbench.py`: paged KV reads hit peak HBM BW on both GPUs). The old fitted 0.316 "KV 3× slower" was a **misattribution** (it was a proxy for under-modeled decode AR — see §8 κ note). | – | **1.0** (measured) |
+| `ρ_ar`  | `decode_ar_overlap`| comm/compute overlap of the per-step decode AR with the layer GEMVs (async-TP). Replaces the misattributed κ; fits to ~0 globally (the effective AR is already baked into `ar_bw_gbs`). | – | **0** (fitted) |
 | `ρ`     | `prefill_overlap`  | fraction of the *smaller* phase hidden under the larger | – | **0.46** (fitted) |
 | `ar_pre`| `prefill_ar_overlap`| fraction of prefill AR hidden under GEMMs | – | **0.8** |
 | `μ`     | `prefill_tf_mult`  | prefill-TFLOPS absolute-level correction | – | 1.0 |
@@ -572,28 +573,39 @@ in §8 are confined to low-load / extreme-workload corners that production avoid
 
 ## 8. Known corrections still needed (honest)
 
-- **Decode-curve shape + the TP↔PP crossover (the hard open correction).** A
-  decode microbenchmark (in=32/out=512, ITL vs batch, TP8 vs TP4PP2 on both models)
-  isolated the decode step time into intercept (batch-independent: weight-stream +
-  AR-floor + dispatch) and slope (batch-linear: KV-read + flops + AR-bandwidth). It
-  showed — for *both* configs — the model's intercept is over-charged and its slope
-  under-charged (the predicted decode curve is too flat), which under-predicts low
-  batch (hurts TP) and over-predicts high batch (flatters PP). Two structural levers
-  were tested honestly: (a) a fitted `decode_ar_overlap` (lift TP8) → the global fit
-  rejected it (→0; decode AR is fully exposed), so it is not an AR-overcharge; (b)
-  making KV-read bandwidth a fitted `kv_bw_scale` → it pinned to **0.32 (KV read ≈3×
-  slower than weight streaming — a real paged-attention effect)**, which steepened the
-  slope and improved absolute accuracy (opt30b MAPE 42→29.5%, 123B 17→14.7%, loss
-  0.34→0.31). **But neither fixed the crossover baseline-losses** (the slope is still
-  ~25–30% short at its bound and the intercept is still high), and production
-  champion/regret was ~flat (25→23/34, 2.1→2.3% — within noise). Honest conclusion:
-  the TP↔PP crossover precision is a genuine analytical-model limit that single-
-  parameter structural fixes do not resolve; `kv_bw_scale` is kept (physically correct,
-  better absolute accuracy). A proper crossover fix is the open research item (a better
-  TP-vs-PP decode-balance model, not a fudge factor); until then the residual risk shows
-  up as the sub-10% near-tie losses in §3.4.
-- **opt30b TP8** (74% MAPE): its no-GQA (`n_kv=n_q=56`) + tied-embed arch mis-scales the TP8
-  KV term — same TP-degree family. TP8 isn't its champion at n≤100, so regret is bounded.
+- **Decode cross-node AllReduce is the real decode-cost driver — and it is an
+  *effective, per-model* quantity (the hard open correction).** A 2026-06-26/27
+  investigation (direct microbenchmarks + in-decode profiling) overturned the earlier
+  `kv_bw_scale` story:
+  - **`kv_bw_scale=0.316` ("KV reads ≈3× slower, paged-attn") was REFUTED by direct
+    measurement** (`kv_bw_microbench.py`, real FlashAttention kernel, both GPUs): paged
+    KV reads hit **peak HBM BW**, scattered-vs-sequential block table makes **zero**
+    difference (consistent with FlashInfer/TurboMind near-peak kernels; no paper
+    establishes a weights-vs-KV BW gap). So κ is now **1.0 (measured)** — it was a
+    misattributed proxy.
+  - **What κ was actually a proxy for: under-modeled decode AllReduce.** Profiling
+    opt30b TP8 decode (`opt30b_tp8_profile.py`, torch profiler) shows **90% of GPU time
+    is `ncclDevKernel_AllReduce`** (3.24 s of 3.6 s) — *not* KV, *not* MHA attention
+    (1.5%), *not* GEMM (7%). The in-decode AR is **814 µs/call for a 917 KB message =
+    ~1.1 GB/s effective**, matching the standalone `ar_microbench.py` (~1 GB/s, two
+    independent measurements). The model's fitted `ar_bw_gbs` (≈4–5) is ~4–5× too high.
+  - **But a single `ar_bw` does not fit all models** — opt30b TP8 wants ar≈1.5, while
+    70B/8B/Mistral TP8 want ar≈4. The difference is **comm/compute overlap**: opt30b's
+    small per-rank weights (3.75 GB) leave the AR ~90% exposed, while 70B/Mistral's
+    larger weights hide the AR under the GEMV stream. The overlap-aware blend
+    (`decode_ar_overlap`) was tried and the global fit rejected it (→0): the effective
+    (overlap-reduced) AR is already implicit in the low fitted `ar_bw`, and it varies
+    per model. So the decode AR is intrinsically an **effective, per-model** cost — no
+    single analytic constant captures it (the `hw_params.json` note flagged this
+    degeneracy). This is the genuine open correction; a per-model overlap-aware AR model
+    is future work. Evidence: `planner/kv_bw_microbench.py`, `ar_microbench.py`,
+    `opt30b_tp8_profile.py`.
+- **opt30b TP8** absolute under-prediction (MAPE ~40% at κ=1): this is the per-model AR
+  gap above — opt30b TP8 is 90% AllReduce and the global `ar_bw` under-charges it (model
+  ~50 ms vs measured ~88 ms). **Ranking is preserved** (TP8 is not opt30b's champion;
+  the planner correctly picks TP4PP2), so this is an absolute-accuracy gap on a config
+  the planner does not select, not a ranking error. Kept honest rather than papered over
+  with the (refuted) κ proxy.
   (At the saturating operating point opt30b still beats baseline +38–73%, fig below.)
 - **Qwen3-32B is a SERVING outlier, root-caused — EXCLUDED from the evaluation (not a
   planner error).** Its **TP4PP2 PP-overlap does not engage**: measured ITL grows with

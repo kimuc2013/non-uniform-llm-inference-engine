@@ -114,7 +114,17 @@ class HardwareSpec:
     c_mb_ms: float = 1.5            # per-microbatch CPU dispatch
     c_chunk_ms: float = 10.0        # per-prefill-chunk overhead
     mem_util: float = 0.85
-    kv_bw_scale: float = 1.0        # KV read BW relative to weight BW
+    kv_bw_scale: float = 1.0        # KV read BW relative to weight BW. MEASURED to be
+                                    # ~1.0 (kv_bw_microbench.py: paged KV reads hit peak
+                                    # HBM BW on both GPUs, no paging penalty) — the old
+                                    # fitted 0.32 "KV 3x slower" was a misattribution
+                                    # (it was absorbing under-modeled decode-AR overlap).
+    decode_ar_overlap: float = 0.0  # comm/compute overlap of the per-step decode
+                                    # AllReduce with the layer GEMVs (async-TP /
+                                    # NCCL async). 0 → AR fully exposed (serial,
+                                    # stage = compute + AR), 1 → AR fully hidden
+                                    # (stage = max(compute, AR)). Replaces the
+                                    # misattributed kv_bw_scale as the decode-slope knob.
     prefill_overlap: float = 0.0    # fraction of prefill compute hidden under
                                     # decode HBM-streaming (chunked continuous
                                     # batching: tensor-core vs HBM overlap).
@@ -182,7 +192,7 @@ def load_hardware(path: Path = HW_PARAMS) -> HardwareSpec:
         fit = json.loads(fp.read_text()).get("fitted", {})
         for k in ("ar_latency_us", "ar_bw_gbs", "intra_ar_latency_us",
                   "overlap_eta", "step_floor_ms", "c_mb_ms", "c_chunk_ms",
-                  "prefill_overlap", "kv_bw_scale"):
+                  "prefill_overlap", "kv_bw_scale", "decode_ar_overlap"):
             if k in fit:
                 kw[k] = fit[k]
     return HardwareSpec(**kw)
@@ -315,7 +325,11 @@ def stage_time_decode_ms(m: ModelSpec, hw: HardwareSpec, w: Workload,
         t_max = max(t_max, max(t_mem, t_flop))
     msg = batch * m.hidden * B_A
     t_ar = 2 * layers * t_allreduce_ms(msg, rs, hw)
-    return t_max + t_ar
+    # Compute (t_max: HBM/tensor-core) and the per-step AllReduce (network) run on
+    # disjoint resources and partially overlap (async-TP / NCCL async): the per-layer
+    # AR is hidden under the next layer's GEMVs. ρ=decode_ar_overlap ∈ [0,1].
+    # This — not a derated KV bandwidth — is the real decode batch-slope mechanism.
+    return max(t_max, t_ar) + (1 - hw.decode_ar_overlap) * min(t_max, t_ar)
 
 
 def stage_time_prefill_ms(m: ModelSpec, hw: HardwareSpec, w: Workload,
