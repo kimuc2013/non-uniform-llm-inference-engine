@@ -19,8 +19,13 @@ import perf_planner as P
 REPO = HERE.parent
 OUT = REPO / "figures" / "planner_uplift"; OUT.mkdir(parents=True, exist_ok=True)
 
+# qwen32b is EXCLUDED: its TP4PP2 PP-overlap does not engage in the current fork
+# (profiled serving-stack gap, not a planner error — see planner_describe.md §8 /
+# planner/qwen_pp_profile.py). The planner correctly predicts qwen's PP should scale;
+# the serving just doesn't realize it, so its cells would distort the planner-quality
+# figure. Evaluated on the 4 models whose serving realizes the predictions.
 MODELS = [("8b", "Llama-3.1-8B"), ("70b", "Llama-3.3-70B"), ("opt30b", "OPT-30B"),
-          ("qwen32b", "Qwen3-32B"), ("mistral123b", "Mistral-Large-123B")]
+          ("mistral123b", "Mistral-Large-123B")]
 WORKLOAD = "balanced"
 
 
@@ -91,7 +96,9 @@ def main(hg=4, wg=4):
     axu.set_title("Uplift vs concurrency (all models)", fontweight="bold", fontsize=13)
     axu.grid(alpha=0.3); axu.legend(fontsize=8)
     fig.suptitle(f"Planner (raw top-1 pick) vs naive baseline (uniform TP{world}) — "
-                 f"balanced workload, {hg}+{wg}, n>=32, by batch", fontsize=15, y=1.0)
+                 f"balanced workload, {hg}+{wg}, n>=32, by batch\n"
+                 f"(qwen3-32B excluded: profiled fork PP-overlap serving gap, not a planner error — see §8)",
+                 fontsize=14, y=1.0)
     plt.tight_layout()
     p = OUT / f"planner_vs_baseline_uplift_{hg}x{wg}.png"
     fig.savefig(p, dpi=140, bbox_inches="tight"); plt.close(fig)

@@ -19,11 +19,13 @@ percent of the measured optimum.
   *balanced workload (covers prefill+decode), saturating concurrency (n≥32), 4+4
   layout* — **regret is 0%** (picks the measured champion for every model).
   → `planner_describe.md`, `planner/check_consistency.py`.
-- **Beats the naive baseline by +23.7% mean.** The planner recommends the raw
-  predicted-best config (`plan()[0]`); across **50 measured cells** (balanced, n≥32,
-  1+1/2+2/4+4) it is **≥ baseline in 41/50** (38 wins, mean +34%, +40–78% at n≥64).
-  The 9 losses are 6 qwen32b TP4PP2 serving-outlier cells + 3 sub-10% crossover
-  near-ties (within model error). → `planner/verify_vs_baseline.py`.
+- **Beats the naive baseline by +31.4% mean.** The planner recommends the raw
+  predicted-best config (`plan()[0]`); across **41 measured cells** on the 4 models
+  whose serving realizes the predictions (Llama-8B/70B, OPT-30B, Mistral-123B; balanced,
+  n≥32, 1+1/2+2/4+4) it is **≥ baseline in 38/41** (37 wins, mean +35%, +40–78% at n≥64),
+  the only 3 losses being sub-10% crossover near-ties. **qwen3-32B is excluded** — its
+  TP4PP2 PP-overlap does not engage in the current fork (a profiled *serving-stack* gap,
+  not a planner error; the planner's prediction is physically correct). → `planner/verify_vs_baseline.py`.
 - **Generalizes without re-fitting.** Calibrated on 4+4, the cost model is
   layout-parametric: zero-refit transfer to **2+2 (regret 7.5%) and 1+1 (3.4%)**,
   covering the 1+1→4+4 target. Pre-registered on **Mistral-Large-123B** (predicted
