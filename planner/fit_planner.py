@@ -15,7 +15,8 @@ Free parameters (9):
 Fixed (anchored from physical derivation in hw_params.json, NOT fitted):
   GPU membw / tflops, p2p, mem capacities, prefill_ar_overlap, NVLink intra-AR.
 
-Loss: median-of-relative-errors (robust to outliers like qwen TP8 cells).
+Loss: median-of-relative-errors (robust to remaining outliers). qwen32b is excluded
+from the fit entirely (profiled serving outlier, planner_describe.md §8).
 Validation: leave-one-model-out (fit on 3 models, test on held-out model).
 """
 from __future__ import annotations
@@ -48,6 +49,8 @@ def load_rows():
     for row in csv.DictReader(open(P.CALIB_CSV)):
         if row["model"] not in P.MODELS:
             continue
+        if row["model"] == "qwen32b":
+            continue  # serving outlier — kept OUT of the fit (planner_describe.md §8)
         if row.get("regime") == "stock":
             continue
         if row.get("workload") in HELD_OUT_WORKLOADS:

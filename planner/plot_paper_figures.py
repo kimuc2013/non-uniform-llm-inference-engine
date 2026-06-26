@@ -215,8 +215,8 @@ def fig_selfval(workload="chat", in_len=768, out_len=256):
         ax.set_xticks(x); ax.set_xticklabels([f"n={n}" for n in ns]); ax.set_title(title, fontweight="bold")
         ax.set_ylabel("throughput (tok/s)"); ax.grid(axis="y", alpha=0.3); ax.legend(fontsize=8)
     fig.suptitle(f"Self-validation on a HELD-OUT workload ({workload} in={in_len}/out={out_len}, "
-                 "not in calibration): SAFE planner vs naive baseline\n"
-                 "never-slower guard: ties baseline at low load, wins big at production load",
+                 "not in calibration): raw planner pick vs naive baseline\n"
+                 "raw predicted-best config (no safety guard) — wins big at production load",
                  fontsize=10)
     plt.tight_layout(); p = OUT / "fig_selfval_vs_baseline.png"
     fig.savefig(p, dpi=140, bbox_inches="tight"); plt.close(fig); print("saved", p)

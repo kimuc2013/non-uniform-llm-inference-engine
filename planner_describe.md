@@ -520,15 +520,18 @@ no-0-layer, no prefill sawtooth, full PP factorization, remainder conservation).
   from **PP-skew gain** (non-uniform PP).
 
 ### 6.3 Current numbers
-Calibration fit (production workloads balanced/decode/prefill): champion 23/34,
-**mean regret 2.3%** (median 0%), Spearman 0.82; TPS-MAPE 70B 11.5% / 8B 13.1% /
-123B 14.7% / opt30b 29.5%. **Layout generalization (zero-refit): 4+4 regret 0.2%
-· 2+2 7.5% · 1+1 3.4%.**
+Calibration fit (`--validate`, 4 models — qwen excluded, §8): champion 34/48,
+**mean regret 3.3%, median 0%**; TPS-MAPE 70B 11.5% / 8B 13.1% / 123B 14.7% /
+opt30b 29.5%. (The mean regret is lifted by single-request `decmicro` probe cells
+— `n=1`, 29–39% regret each, calibration shapes not serving load; at saturating
+serving load it is far lower, see the realistic operating point below.) **Layout
+generalization (zero-refit): 4+4 regret 0.2% · 2+2 7.5% · 1+1 3.4%.**
 
 **Realistic operating point — the headline validation.** On the *balanced*
 workload (covers prefill+decode, not skewed), at *saturating concurrency*
 (n∈{32,64,96}, where the GPUs are fully utilized and the choice actually matters),
-across 8B/70B/123B × {1+1,2+2,4+4} = 18 cells:
+across 8B/70B/123B × their memory-feasible layouts (8B all 3, 70B 2+2/4+4, 123B 4+4)
+× n∈{32,64,96} = 18 cells:
 - At **4+4 (the production layout): regret = 0%** for every model and n (the
   planner picks the measured champion exactly).
 - **Raw planner (4 models whose serving realizes the predictions): mean +31.4% over

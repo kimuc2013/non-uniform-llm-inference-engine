@@ -1,6 +1,7 @@
-"""Planner uplift over the naive baseline, per batch (concurrency), for all 5
-models. Two bars per batch — baseline (uniform TP=world) and the planner's RAW
-top-1 pick (no safety guard) — with the uplift % labeled. No 'measured best' bar.
+"""Planner uplift over the naive baseline, per batch (concurrency), for the 4
+models whose serving realizes the predictions (qwen3-32B excluded — profiled fork
+PP-overlap gap, see planner_describe.md §8). Two bars per batch — baseline (uniform
+TP=world) and the planner's RAW top-1 pick (no safety guard) — uplift % labeled. No 'measured best' bar.
 
 Only n_req >= 32 is shown: small batches do not saturate the cluster and are not
 a representative serving regime. Balanced workload (covers prefill+decode).

@@ -1,4 +1,10 @@
-# 핸드오프 — 이종 TP/PP 서빙 플래너 (2026-06-12)
+# 핸드오프 — 이종 TP/PP 서빙 플래너
+
+> ⚠️ **이 파일은 세션별 작업 로그입니다 (날짜별 체크포인트 수치 포함, 일부는 옛 fit 상태).**
+> **현재 권위 있는 상태/수치는 `README.md` + `planner_describe.md`(특히 §6.3, §8) 를 보세요.**
+> 최신 요약(2026-06-26): plan_safe 제거→raw argmax; qwen3-32B는 fork PP-overlap 서빙 갭으로
+> 평가서 제외(근본 규명, §8); 4-모델 헤드라인 +31.4% mean / 38·41; `--validate` regret 3.3%
+> (median 0%, n=1 probe가 평균 끌어올림); check_consistency 17개.
 
 ## 큰 그림
 4+4 cross-node 클러스터(head=4×Blackwell 96GB, worker=4×Ada 48GB, IB)에서
