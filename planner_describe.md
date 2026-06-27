@@ -611,6 +611,24 @@ in §8 are confined to low-load / extreme-workload corners that production avoid
     outlier**, not a model failure. A proper across-layer AR-pipelining model is the open
     correction. Evidence: `planner/kv_bw_microbench.py`, `ar_microbench.py`,
     `opt30b_tp8_profile.py`.
+  - **AR cost is now a measured 2-D surface over (n_local, message) — fixes the TP
+    under-prediction at 2+2/1+1 (2026-06-27).** The old inter-node term was independent of
+    `n_local` (assumed perfect per-node NIC sharing), so it over-charged small layouts
+    (under-predicted tensor-parallel TP at 1+1/2+2) and under-charged 8-rank (over-predicted
+    TP8). A rank-scaling microbench (`ar_microbench.py` at world=2/4/8, CUDA-graph) measured
+    the isolated cross-node AR algbw: at the ~1 MB decode message it is **6.0 / 4.7 / 1.1
+    GB/s for n_local = 1 / 2 / 4** — the slow Ada node's single IB NIC + shared PCIe does not
+    parallelize across local GPUs, so bandwidth collapses ~5× from 1+1 to 4+4. It *also*
+    depends on message size (NCCL LL→Simple transition near 1 MB): below it every layout is
+    ~1 GB/s, which is why an 8 B model (0.5 MB AR) sees no small-layout speed-up but a 70 B
+    model (1.05 MB) does. Both effects are encoded as `_ISO_AR_SURFACE` (see
+    `planner/ar_rank_scaling.md`); `t_allreduce_ms` scales the AR bandwidth by the measured
+    ratio to the n_local=4 @ ~1 MB anchor, so **the calibrated 4+4 predictions are
+    byte-identical** while 2+2/1+1 improve. Effect on tensor-parallel absolute error:
+    70B 2+2 −44%→−10% (and its ranking flips to the correct TP4 champion), 8B 2+2 −26%→−15%,
+    8B 1+1 −33%→−19%. opt30b stays the overlap outlier (its low overlap means even its
+    cheaper small-layout AR is more exposed than the constant-overlap surface assumes — at
+    2+2 the planner now slightly favors TP4 over the measured TP2PP2 champion).
 - **opt30b TP8** absolute under-prediction (MAPE ~40% at κ=1): this is the per-model AR
   gap above — opt30b TP8 is 90% AllReduce and the global `ar_bw` under-charges it (model
   ~50 ms vs measured ~88 ms). **Ranking is preserved** (TP8 is not opt30b's champion;

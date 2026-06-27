@@ -260,6 +260,53 @@ def params_on_rank(m: ModelSpec, layers: int, head_r: int, ffn_r: int,
     return p
 
 
+# Measured isolated cross-node all-reduce algorithm bandwidth (GB/s) as a 2-D
+# surface over (ranks-per-node on the slow Ada/PCIe side, message size). Captured
+# CUDA-graph (in-decode-representative) via planner/ar_microbench.py at world=2/4/8
+# (1+1, 2+2, 4+4), 2026-06-27. Two effects are baked in:
+#   (1) NCCL LL->Simple protocol transition near ~1 MB: below it every layout is
+#       latency-bound (~1 GB/s); above it bandwidth opens up.
+#   (2) n_local (Ada PCIe/NIC funnel) contention: at large messages the single
+#       per-node IB NIC + shared PCIe does NOT parallelize across local GPUs, so
+#       bandwidth collapses as n_local grows (6.0 / 4.7 / 1.1 GB/s for 1/2/4).
+# This is why an 8 B model (0.5 MB AR) sees no small-layout speed-up while a 70 B
+# model (1.05 MB) does — message size, not just topology, gates the cost.
+_ISO_AR_SURFACE = {                                       # n_local -> [(msg_MB, GB/s)]
+    1: [(0.066, 0.6), (0.131, 1.0), (0.262, 1.2), (0.524, 1.5), (1.049, 6.0), (2.097, 9.1)],
+    2: [(0.066, 0.4), (0.131, 0.8), (0.262, 1.0), (0.524, 1.1), (1.049, 4.7), (2.097, 6.7)],
+    4: [(0.524, 1.0), (1.049, 1.1), (1.573, 1.1)],
+}
+_ISO_AR_REF = 1.07          # _iso_ar_bw(n_local=4, ~1.05 MB): the ar_bw_gbs anchor
+
+
+def _row_bw(row, msg_mb: float) -> float:
+    if msg_mb <= row[0][0]:
+        return row[0][1]
+    if msg_mb >= row[-1][0]:
+        return row[-1][1]
+    for (a, ba), (b, bb) in zip(row, row[1:]):
+        if a <= msg_mb <= b:
+            t = (math.log(msg_mb) - math.log(a)) / (math.log(b) - math.log(a))
+            return math.exp(math.log(ba) + t * (math.log(bb) - math.log(ba)))
+    return row[-1][1]
+
+
+def _iso_ar_bw(n_local: int, msg_mb: float) -> float:
+    """Measured isolated cross-node AR bandwidth (GB/s) at (n_local, message)."""
+    keys = sorted(_ISO_AR_SURFACE)
+    if n_local <= keys[0]:
+        return _row_bw(_ISO_AR_SURFACE[keys[0]], msg_mb)
+    if n_local >= keys[-1]:
+        return _row_bw(_ISO_AR_SURFACE[keys[-1]], msg_mb)
+    for a, b in zip(keys, keys[1:]):
+        if a <= n_local <= b:
+            ba = _row_bw(_ISO_AR_SURFACE[a], msg_mb)
+            bb = _row_bw(_ISO_AR_SURFACE[b], msg_mb)
+            t = (math.log(n_local) - math.log(a)) / (math.log(b) - math.log(a))
+            return math.exp(math.log(ba) + t * (math.log(bb) - math.log(ba)))
+    return _row_bw(_ISO_AR_SURFACE[keys[-1]], msg_mb)
+
+
 def t_allreduce_ms(msg_bytes: float, ranks: list, hw: HardwareSpec) -> float:
     """Hierarchical (2-tier) all-reduce cost over the actual rank placement.
 
@@ -291,7 +338,12 @@ def t_allreduce_ms(msg_bytes: float, ranks: list, hw: HardwareSpec) -> float:
     # inter-node volume on the bottleneck NIC is 2(n_nodes-1)/n_nodes·msg (the
     # /n_local of per-GPU traffic cancels against n_local GPUs sharing the NIC).
     t_intra = (2 * (n_local - 1) / n_local * msg_bytes) / (hw.intra_ar_bw_gbs * 1e9) * 1e3
-    t_inter = (2 * (n_nodes - 1) / n_nodes * msg_bytes) / (hw.ar_bw_gbs * 1e9) * 1e3
+    # Inter-node bandwidth is a measured surface over (n_local, message): it
+    # degrades with n_local (Ada-side PCIe/NIC contention) AND opens up above the
+    # NCCL LL->Simple threshold (~1 MB). ar_bw_gbs anchors the n_local=4 @ ~1 MB
+    # point; everything else scales by the measured ratio to that anchor.
+    eff_ar_bw = hw.ar_bw_gbs * _iso_ar_bw(n_local, msg_bytes / 1e6) / _ISO_AR_REF
+    t_inter = (2 * (n_nodes - 1) / n_nodes * msg_bytes) / (eff_ar_bw * 1e9) * 1e3
     lat = 2 * (n_nodes - 1) * hw.ar_latency_us + 2 * (n_local - 1) * hw.intra_ar_latency_us
     return t_intra + t_inter + lat / 1e3
 
