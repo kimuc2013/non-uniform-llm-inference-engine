@@ -499,7 +499,16 @@ def mem_feasible(m: ModelSpec, hw: HardwareSpec, w: Workload, cfg: Config):
             g = hw.gpu_of_rank(r)
             weights = params_on_rank(m, layers, cfg.head_splits[i],
                                      cfg.ffn_splits[i], cfg.tp, embed) * B_W
-            kv = w.n_req * (w.in_len + w.out_len) * layers * 2 \
+            # Paged KV (vLLM v1 continuous batching): KV is allocated on demand
+            # from the HBM left over after weights+activations; the scheduler
+            # admits only as many running sequences as fit and queues the rest.
+            # Feasibility therefore needs room for the resident weights/acts plus
+            # at least ONE full-length sequence's KV — NOT all n_req co-resident
+            # (the old `w.n_req *` factor was a peak-concurrency residency
+            # assumption the engine does not make; it only bit multi-head models
+            # where per-rank KV is large, e.g. opt30b n_kv=56). Concurrency-limited
+            # throughput is predict()'s concern, not a hard OOM.
+            kv = (w.in_len + w.out_len) * layers * 2 \
                  * cfg.kv_splits[i] * m.head_dim * B_KV
             act = C_ACT * T_CHUNK * max(m.hidden, 2 * cfg.ffn_splits[i]) * B_A
             overhead = (1.5 + 2.0) * 1e9      # CUDA ctx/NCCL + graph pool

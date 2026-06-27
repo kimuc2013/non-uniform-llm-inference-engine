@@ -629,12 +629,41 @@ in §8 are confined to low-load / extreme-workload corners that production avoid
     8B 1+1 −33%→−19%. opt30b stays the overlap outlier (its low overlap means even its
     cheaper small-layout AR is more exposed than the constant-overlap surface assumes — at
     2+2 the planner now slightly favors TP4 over the measured TP2PP2 champion).
-- **opt30b TP8** absolute under-prediction (MAPE ~40% at κ=1): this is the per-model AR
-  gap above — opt30b TP8 is 90% AllReduce and the global `ar_bw` under-charges it (model
-  ~50 ms vs measured ~88 ms). **Ranking is preserved** (TP8 is not opt30b's champion;
-  the planner correctly picks TP4PP2), so this is an absolute-accuracy gap on a config
-  the planner does not select, not a ranking error. Kept honest rather than papered over
-  with the (refuted) κ proxy.
+- **opt30b memory false-negative at 1+1 — FIXED (2026-06-27).** `mem_feasible` charged KV
+  for ALL `n_req` sequences co-resident at full length (`w.n_req * ...`), but vLLM v1 pages
+  KV under continuous batching: it reserves the HBM left after weights+activations as a block
+  pool and admits only as many running sequences as fit, queuing the rest. The feasibility
+  floor is therefore weights + activations + **one** full-length sequence's KV, not all
+  `n_req`. The old factor only bit the multi-head opt30b (n_kv=56 → per-rank KV 7× the GQA
+  big-3) and falsely rejected its 1+1 layout (predict()=0) even though it RAN at TP2 ~1050,
+  TP1PP2 ~881 tps. The fix (drop the `w.n_req` multiplier) is fully general (driven by
+  in_len/out_len/layers/kv_splits/head_dim, no model constant), only *decreases* `need` so it
+  cannot reject a previously-accepted config, and now gives opt30b 1+1 a correctly-ranked
+  recommendation (predict TP2 866 > TP1PP2 648, matching the measured order). verify_vs_baseline
+  stays 42/43 ≥ baseline (+29.3%, two opt30b 1+1 cells newly scored), invariants 17/17.
+- **opt30b TP8 over-prediction (problem A) — investigated exhaustively; an honest irreducible
+  gap, NOT papered over.** Direct measurement settled the mechanism. (1) Cross-node decode AR
+  is plain NCCL on the *default compute stream* (custom all-reduce is hard-disabled across
+  nodes; no async offload, no GEMM-comm fusion) — confirmed in the vLLM source
+  (`cuda_communicator.py`, `custom_all_reduce.py:89-93`, `pynccl.py:187`). So there is no true
+  stream overlap. (2) Yet the data shows the **GQA big-3 (8b/70b/mistral) run their in-decode
+  AR ~1.8× faster than the isolated microbench** (70B's 160 ARs would cost ~152 ms at the
+  measured isolated 1.1 GB/s, but its whole ITL is only 84 ms), while **opt30b runs AT
+  isolated speed** (80 ms of AR in its 88 ms ITL, matching its torch-profile of 90%
+  ncclAllReduce @ 1.1 GB/s). (3) The plausible "inter-AR compute amortizes the AR" hypothesis
+  was **directly FALSIFIED** by a spaced microbench (`planner/ar_spaced_microbench.py`):
+  inserting a 0.36 ms GEMM (or a memory-bound read) between consecutive cross-node ARs does
+  NOT speed them up (0.95 ms back-to-back → 1.11 ms with a GEMM spacer — if anything slower).
+  (4) The only computable quantity that cleanly separates opt30b from the big-3 is its
+  attention type — multi-head **n_kv=56** vs grouped-query **n_kv=8**. With opt30b the lone
+  AR-bound outlier, fitting any overlap/relief function to it would be **끼워맞추기 (overfitting
+  one sample)** — forbidden. So the planner keeps the big-3-calibrated effective `ar_bw`
+  (which predicts 8b/70b/mistral within ~2%) and over-predicts opt30b TP8; this is documented,
+  not fudged. **Ranking is preserved at 4+4** (TP8 is not opt30b's champion — the planner picks
+  TP4PP2), so it is an absolute-accuracy gap on a config the planner does not select. The 2+2
+  ranking nudge (problem B: planner favors TP4 over the measured TP2PP2) has the same single
+  root cause and is left as the same honest gap. Resolving it cleanly needs a second multi-head
+  (MHA) model to calibrate against — a pre-registered generalization test, not a fit.
   (At the saturating operating point opt30b still beats baseline +38–73%, fig below.)
 - **Qwen3-32B is a SERVING outlier, root-caused — EXCLUDED from the evaluation (not a
   planner error).** Its **TP4PP2 PP-overlap does not engage**: measured ITL grows with
