@@ -48,6 +48,21 @@ class ModelSpec:
     params_b: float                 # total params (B)
     ffn_kind: str = "swiglu"        # swiglu (3 mats) | gelu (2 mats)
     tied_embed: bool = False
+    # Mixture-of-Experts. Dense models leave these at 1 → every MoE expression
+    # below collapses to the dense one (the dense code path is byte-identical).
+    # For MoE: ffn_dim is the PER-EXPERT intermediate; n_experts experts per layer,
+    # top_k routed per token. Experts are TP-sharded (no expert-parallel all-to-all),
+    # so the hidden-state AllReduce is unchanged.
+    n_experts: int = 1
+    top_k: int = 1
+
+    def active_experts(self, batch: int) -> float:
+        """Expected number of DISTINCT experts a `batch`-token step activates (so
+        their weights must be streamed once each — the memory-bound decode cost).
+        batch=1 → top_k; batch→∞ → n_experts. Dense (n_experts=1) → 1.0."""
+        if self.n_experts <= 1:
+            return 1.0
+        return self.n_experts * (1.0 - (1.0 - self.top_k / self.n_experts) ** batch)
 
     @property
     def p_attn(self) -> float:      # per-layer attention params
@@ -83,6 +98,9 @@ MODELS = {
     "opt30b": ModelSpec("facebook/opt-30b", 48, 7168, 28672, 56, 56, 128, 50272, 30.0, ffn_kind="gelu", tied_embed=True),
     "qwen32b": ModelSpec("Qwen/Qwen3-32B", 64, 5120, 25600, 64, 8, 128, 151936, 32.8),
     "mistral123b": ModelSpec("mistralai/Mistral-Large-Instruct-2411", 88, 12288, 28672, 96, 8, 128, 32768, 123.0),
+    # MoE: 8 experts, top-2; ffn_dim is the PER-EXPERT intermediate (14336).
+    "mixtral8x7b": ModelSpec("mistralai/Mixtral-8x7B-Instruct-v0.1", 32, 4096, 14336, 32, 8, 128, 32000, 46.7,
+                             ffn_kind="swiglu", n_experts=8, top_k=2),
 }
 
 
@@ -254,8 +272,11 @@ def embed_on_stage(m: ModelSpec, pp: int, stage: int) -> float:
 
 
 def params_on_rank(m: ModelSpec, layers: int, head_r: int, ffn_r: int,
-                   tp: int, embed_params: float) -> float:
-    p = layers * (m.p_attn * head_r / m.n_q + m.p_ffn * ffn_r / m.ffn_dim)
+                   tp: int, embed_params: float, expert_mult: float = 1.0) -> float:
+    """Per-rank parameter count. `expert_mult` scales ONLY the FFN (per-expert)
+    term: =n_experts for resident memory, =active_experts(B) for the decode weight
+    stream, =top_k for the active FLOPs. Dense (expert_mult=1.0) is unchanged."""
+    p = layers * (m.p_attn * head_r / m.n_q + expert_mult * m.p_ffn * ffn_r / m.ffn_dim)
     p += embed_params / tp
     return p
 
@@ -367,13 +388,18 @@ def stage_time_decode_ms(m: ModelSpec, hw: HardwareSpec, w: Workload,
     t_max = 0.0
     for i, r in enumerate(rs):
         g = hw.gpu_of_rank(r)
-        pr = params_on_rank(m, layers, cfg.head_splits[i], cfg.ffn_splits[i],
-                            cfg.tp, embed)
-        w_bytes = pr * B_W
+        # MoE: the weight STREAM reads each distinct activated expert once
+        # (active_experts(batch)); the FLOPs touch only top_k experts/token. Dense
+        # → both expert_mult=1.0 → identical to before.
+        pr_mem = params_on_rank(m, layers, cfg.head_splits[i], cfg.ffn_splits[i],
+                                cfg.tp, embed, expert_mult=m.active_experts(batch))
+        pr_flop = params_on_rank(m, layers, cfg.head_splits[i], cfg.ffn_splits[i],
+                                 cfg.tp, embed, expert_mult=m.top_k)
+        w_bytes = pr_mem * B_W
         kv_read = batch * w.kv_avg * layers * 2 * cfg.kv_splits[i] * m.head_dim * B_KV
         t_mem = (w_bytes / (g.membw_gbs * 1e9)
                  + kv_read / (g.membw_gbs * hw.kv_bw_scale * 1e9)) * 1e3
-        t_flop = (2 * pr * batch) / (g.tflops_prefill * 1e12) * 1e3
+        t_flop = (2 * pr_flop * batch) / (g.tflops_prefill * 1e12) * 1e3
         t_max = max(t_max, max(t_mem, t_flop))
     msg = batch * m.hidden * B_A
     t_ar = 2 * layers * t_allreduce_ms(msg, rs, hw)
@@ -392,10 +418,12 @@ def stage_time_prefill_ms(m: ModelSpec, hw: HardwareSpec, w: Workload,
     t_max = 0.0
     for i, r in enumerate(rs):
         g = hw.gpu_of_rank(r)
-        pr = params_on_rank(m, layers, cfg.head_splits[i], cfg.ffn_splits[i],
-                            cfg.tp, embed)
-        t_flop = (2 * pr * chunk_tokens) / (g.tflops_prefill * hw.prefill_tf_mult * 1e12) * 1e3
-        t_mem = (pr * B_W) / (g.membw_gbs * 1e9) * 1e3
+        pr_flop = params_on_rank(m, layers, cfg.head_splits[i], cfg.ffn_splits[i],
+                                 cfg.tp, embed, expert_mult=m.top_k)
+        pr_mem = params_on_rank(m, layers, cfg.head_splits[i], cfg.ffn_splits[i],
+                                cfg.tp, embed, expert_mult=m.active_experts(chunk_tokens))
+        t_flop = (2 * pr_flop * chunk_tokens) / (g.tflops_prefill * hw.prefill_tf_mult * 1e12) * 1e3
+        t_mem = (pr_mem * B_W) / (g.membw_gbs * 1e9) * 1e3
         t_max = max(t_max, max(t_flop, t_mem))
     msg = chunk_tokens * m.hidden * B_A
     # In prefill the TP AllReduce of large (chunk-sized) messages overlaps the
@@ -497,8 +525,10 @@ def mem_feasible(m: ModelSpec, hw: HardwareSpec, w: Workload, cfg: Config):
         embed = embed_on_stage(m, cfg.pp, s)
         for i, r in enumerate(rs):
             g = hw.gpu_of_rank(r)
+            # MoE: ALL experts are resident (only a subset is active per token).
             weights = params_on_rank(m, layers, cfg.head_splits[i],
-                                     cfg.ffn_splits[i], cfg.tp, embed) * B_W
+                                     cfg.ffn_splits[i], cfg.tp, embed,
+                                     expert_mult=m.n_experts) * B_W
             # Paged KV (vLLM v1 continuous batching): KV is allocated on demand
             # from the HBM left over after weights+activations; the scheduler
             # admits only as many running sequences as fit and queues the rest.
