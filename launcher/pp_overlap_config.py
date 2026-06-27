@@ -251,6 +251,7 @@ MODEL_PARAMS_B: dict[str, float] = {
     "Qwen/Qwen2.5-7B-Instruct": 7.0,
     "Qwen/Qwen3-8B": 8.0,
     "facebook/opt-30b": 30.0,
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": 46.7,   # MoE total params (cf. Qwen3-235B-A22B)
 }
 
 
