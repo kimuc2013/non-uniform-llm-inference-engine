@@ -1,0 +1,107 @@
+{
+  "blackwell": {
+    "eff_membw_decode_gbs": 1517.0,
+    "eff_tflops_prefill": 417.0,
+    "mem_gb": 96
+  },
+  "ada": {
+    "eff_membw_decode_gbs": 887.0,
+    "eff_tflops_prefill": 116.0,
+    "mem_gb": 48
+  },
+  "interconnect": {
+    "ar_latency_us": 48.0,
+    "ar_bw_gbs": 4.11,
+    "p2p_latency_us": 200.0,
+    "p2p_bw_gbs": 10.0
+  },
+  "intra": {
+    "intra_ar_bw_gbs": 60.0,
+    "intra_ar_latency_us": 5.0,
+    "nvlink_ar_bw_gbs": 800.0,
+    "nvlink_ar_latency_us": 4.0
+  },
+  "iso_ar_surface": {
+    "1": [
+      [
+        0.066,
+        0.6
+      ],
+      [
+        0.131,
+        1.0
+      ],
+      [
+        0.262,
+        1.2
+      ],
+      [
+        0.524,
+        1.5
+      ],
+      [
+        1.049,
+        6.0
+      ],
+      [
+        2.097,
+        9.1
+      ]
+    ],
+    "2": [
+      [
+        0.066,
+        0.4
+      ],
+      [
+        0.131,
+        0.8
+      ],
+      [
+        0.262,
+        1.0
+      ],
+      [
+        0.524,
+        1.1
+      ],
+      [
+        1.049,
+        4.7
+      ],
+      [
+        2.097,
+        6.7
+      ]
+    ],
+    "4": [
+      [
+        0.524,
+        1.0
+      ],
+      [
+        1.049,
+        1.1
+      ],
+      [
+        1.573,
+        1.1
+      ]
+    ]
+  },
+  "kv_bw_scale": 1.0,
+  "_notes": {
+    "measured": [
+      "membw",
+      "tflops",
+      "iso_ar_surface",
+      "ar_latency_us(intercept)",
+      "kv_bw_scale"
+    ],
+    "effective_factor": "ar_bw_gbs = isolated_anchor(1.1) x AR_EFFECTIVE_FACTOR(3.74) = the one engine-structural constant (in-decode AR pipelining) not reproducible by an isolated bench",
+    "priors": [
+      "p2p (small effect on PP send)",
+      "intra_ar (NVLink/PCIe)"
+    ]
+  }
+}

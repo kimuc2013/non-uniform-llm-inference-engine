@@ -22,6 +22,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -201,17 +202,44 @@ def load_hardware(path: Path = HW_PARAMS) -> HardwareSpec:
         p2p_bw_gbs=ic["p2p_bw_gbs"],
         prefill_ar_overlap=d.get("prefill_ar_overlap", 0.0),
     )
+    # Overlay MEASURED hardware constants from a pre-serving calibration run
+    # (planner/calibrate.py), if the env points to one. These supersede both the
+    # hw_params base and the fit for the HARDWARE constants they cover; the fit
+    # below is then prevented from clobbering them (measured_keys). Default (env
+    # unset) → byte-identical to the previous fitted-only behaviour.
+    measured_keys = set()
+    mp_env = os.environ.get("PLANNER_MEASURED_PARAMS", "")
+    mp = Path(mp_env) if mp_env else None
+    if mp and mp.exists():
+        m = json.loads(mp.read_text())
+        bw_m = GpuType("blackwell", m["blackwell"]["eff_tflops_prefill"],
+                       m["blackwell"]["eff_membw_decode_gbs"], m["blackwell"]["mem_gb"])
+        ada_m = GpuType("ada", m["ada"]["eff_tflops_prefill"],
+                        m["ada"]["eff_membw_decode_gbs"], m["ada"]["mem_gb"])
+        kw["nodes"] = ((bw_m, kw["nodes"][0][1]), (ada_m, kw["nodes"][1][1]))
+        ic2, intra2 = m["interconnect"], m["intra"]
+        kw.update(ar_latency_us=ic2["ar_latency_us"], ar_bw_gbs=ic2["ar_bw_gbs"],
+                  p2p_latency_us=ic2["p2p_latency_us"], p2p_bw_gbs=ic2["p2p_bw_gbs"],
+                  intra_ar_bw_gbs=intra2["intra_ar_bw_gbs"],
+                  intra_ar_latency_us=intra2["intra_ar_latency_us"],
+                  nvlink_ar_bw_gbs=intra2["nvlink_ar_bw_gbs"],
+                  nvlink_ar_latency_us=intra2["nvlink_ar_latency_us"],
+                  kv_bw_scale=m.get("kv_bw_scale", 1.0))
+        measured_keys = {"ar_latency_us", "ar_bw_gbs", "intra_ar_latency_us", "kv_bw_scale"}
+        if "iso_ar_surface" in m:
+            global _ISO_AR_SURFACE, _ISO_AR_REF
+            _ISO_AR_SURFACE = {int(k): [tuple(p) for p in v] for k, v in m["iso_ar_surface"].items()}
+            _ISO_AR_REF = _iso_ar_bw(min(4, max(_ISO_AR_SURFACE)), 1.049)
     # Overlay calibration-fitted engine params if present so the planner
-    # actually predicts with the fit (fit_planner.py output). Without this the
-    # CLI / --validate path silently used dataclass defaults, disconnected
-    # from the fit.
+    # actually predicts with the fit (fit_planner.py output). Measured keys are
+    # NOT re-overlaid by the fit.
     fp = HERE / "fitted_params.json"
     if fp.exists():
         fit = json.loads(fp.read_text()).get("fitted", {})
         for k in ("ar_latency_us", "ar_bw_gbs", "intra_ar_latency_us",
                   "overlap_eta", "step_floor_ms", "c_mb_ms", "c_chunk_ms",
                   "prefill_overlap", "kv_bw_scale", "decode_ar_overlap"):
-            if k in fit:
+            if k in fit and k not in measured_keys:
                 kw[k] = fit[k]
     return HardwareSpec(**kw)
 
