@@ -592,13 +592,24 @@ in §8 are confined to low-load / extreme-workload corners that production avoid
   - **But a single `ar_bw` does not fit all models** — opt30b TP8 wants ar≈1.5, while
     70B/8B/Mistral TP8 want ar≈4. The difference is **comm/compute overlap**: opt30b's
     small per-rank weights (3.75 GB) leave the AR ~90% exposed, while 70B/Mistral's
-    larger weights hide the AR under the GEMV stream. The overlap-aware blend
-    (`decode_ar_overlap`) was tried and the global fit rejected it (→0): the effective
-    (overlap-reduced) AR is already implicit in the low fitted `ar_bw`, and it varies
-    per model. So the decode AR is intrinsically an **effective, per-model** cost — no
-    single analytic constant captures it (the `hw_params.json` note flagged this
-    degeneracy). This is the genuine open correction; a per-model overlap-aware AR model
-    is future work. Evidence: `planner/kv_bw_microbench.py`, `ar_microbench.py`,
+    larger weights hide the AR under the GEMV stream.
+  - **The relationship is actually clean** — back out the in-decode AR from each model's
+    TP8 ITL (measured − weight − KV − flop − floor, all at peak BW): normalized by
+    `L·hidden`, the *effective* AR per step is **88–92 for 8B/70B/Mistral** (≈ constant —
+    effective AR BW ≈ 2.9 GB/s) and an **outlier 199 for opt30b** (≈ 1.3 GB/s). And the
+    cause is **overlap, not a NCCL/hidden-alignment quirk**: a hidden-size AR sweep
+    (`ar_microbench.py AR_HIDDEN_SWEEP=1`) shows the *isolated* cross-node AR is a smooth
+    ~1 GB/s vs message size for ALL hidden ∈ {4096,6144,**7168**,7680,8192,10240,12288}
+    — `hidden=7168` is NOT anomalous. So: isolated AR ≈ 1 GB/s (clean, ∝ message);
+    in-decode effective AR = isolated × overlap; the 3 big models all reach ~2.9 GB/s
+    effective (≈3× overlap from their large GEMV stream + deeper layer pipeline), opt30b
+    reaches only ~1.3 (its small per-rank compute can't hide the AR).
+  - The overlap-aware blend (`decode_ar_overlap`) was tried but the global fit rejected it
+    (→0) because the simple `max(compute,AR)+(1−ρ)·min` form doesn't capture AR pipelining
+    *across layers*; the effective per-model overlap is instead implicit in the fitted
+    `ar_bw` (which lands right for the 3 big models). So opt30b is a genuine **overlap
+    outlier**, not a model failure. A proper across-layer AR-pipelining model is the open
+    correction. Evidence: `planner/kv_bw_microbench.py`, `ar_microbench.py`,
     `opt30b_tp8_profile.py`.
 - **opt30b TP8** absolute under-prediction (MAPE ~40% at κ=1): this is the per-model AR
   gap above — opt30b TP8 is 90% AllReduce and the global `ar_bw` under-charges it (model
