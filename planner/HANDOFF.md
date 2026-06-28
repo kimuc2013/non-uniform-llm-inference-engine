@@ -6,6 +6,59 @@
 > 평가서 제외(근본 규명, §8); 4-모델 헤드라인 +31.4% mean / 38·41; `--validate` regret 3.3%
 > (median 0%, n=1 probe가 평균 끌어올림); check_consistency 17개.
 
+---
+# ★ 현재 상태 (2026-06-28) — 다른 서버/새 에이전트가 이어받을 때 여기부터 읽으세요
+
+## 한 줄 상태
+플래너 코어 완성·검증됨. **전 레이아웃(4+4/2+2/1+1) fresh 재측정 완료**, MoE 지원 추가·검증,
+하드웨어 자동보정 추가, 통신 모델 정정. 결과 패키지 + 그래프 + 정확한 설명 문서 작성됨.
+**GitHub `kimuc2013/non-uniform-llm-inference-engine` main 에 전부 푸시됨 (~6caad92).**
+
+## 이번 세션(2026-06-23~28)에 한 것
+1. **MoE 지원 (모듈식, dense 무변화)** — `perf_planner.py` ModelSpec `n_experts`/`top_k`(기본1),
+   `active_experts(B)=n_experts·(1−(1−top_k/n_experts)^B)`로 FFN 3분기(메모리=전체/디코드읽기=활성/
+   FLOPs=top_k). mixtral8x7b 추가. **Mixtral 사전등록→zero-refit 4/4 챔피언**(배치의존 TP8→TP4PP2 교차점).
+2. **통신(AllReduce) 모델 정정 + 측정** — 옛 `kv_bw_scale=0.32` 기각(KV는 peak BW, κ=1). 노드간 AR
+   대역폭 **2D 측정표**(`_ISO_AR_SURFACE`, n_local×메시지) → 2+2/1+1 TP 과소예측 수정. **직접 프로파일로
+   70b도 84% AR-바운드 확인**("70b 가중치-바운드"는 철회). 통신 측정 가능(~1.1-1.4GB/s, 서빙 NCCL설정).
+   유효 ar_bw≈4 = 측정커널(~1.3) × **파이프라인 동시성(~3, 잔여 엔진상수 1개)**.
+3. **하드웨어 자동보정** — `calibrate.py`+`compute_microbench.py`: 모델 로드 없이(서빙 프로브는 자기모순)
+   membw/TFLOPS/AR표를 측정 → `PLANNER_MEASURED_PARAMS`로 `load_hardware` 오버레이. 측정상수만으로 40/43.
+4. **opt30b 메모리 false-negative 수정**(페이지드 KV: n_req 곱 제거) — 1+1 추천 가능해짐.
+5. **전 레이아웃 fresh 재측정 캠페인** — `run_campaign.sh`(env로 configs/workloads 조정).
+   4+4 5모델×3워크로드 풀그리드, 2+2/1+1 lean(planner+baseline, balanced). 옛 결과는
+   `results/_archive_pre_recampaign/`로 이동. **검증: verify_vs_baseline 59/67 ≥ baseline(+79% mean),
+   check_consistency 17/17.** TP8 베이스라인 의심 2건 → 재측정 재현(저하 아님, 진짜 포화).
+6. **그래프** — `plot_planner_uplift.py`(픽 배너+비균등 라벨, 범례/막대내텍스트 제거),
+   `plot_per_model_configs.py`(모델별 설정 막대그래프). 전부 `figures/`.
+7. **결과 패키지** — `RESULTS_PACKAGE/`(+`.tar.gz`): data CSV(636셀)+figures(14)+docs(설명2). 논문/다운로드용.
+
+## 핵심 수치 (fresh, 권위값)
+- 4+4 balanced 플래너 픽 vs 균등 TP_world: 8b +118/+92/+130%, 70b +59/+169/+273%, opt +28/+76/+176%,
+  mistral123b +74/+195/+29% (n=32/64/96). **이유: 균등 TP8 고부하 포화(70b ~390 flat, AR바운드),
+  플래너 비균등 TP4PP2 스케일(1514).**
+- 검증 59/67, +79% mean, 17/17 불변식. 최대 손실 mixtral 4+4 prefill_heavy n=32 −19.6%(MoE 프리필).
+
+## 정직한 한계 (다음 사람이 알아야)
+- **opt30b TP8 과대예측**: AR-바운드 단일 아웃라이어(MHA n_kv=56). 끼워맞추기 금지라 미수정, 단 4+4 순위 보존.
+- **2+2/1+1**: 재보정 0 일반화라 덜 정확. **MoE EP(all-to-all)**: 범위 밖(TP-분할만, vLLM 기본).
+- **유효 AR 동시성(~3)**: 격리 벤치로 못 보는 잔여 엔진상수 1개. 2번째 MHA 모델 있으면 더 풀림.
+
+## 다른 서버에서 이어가기 (중요)
+- **플래너 실행(예측/추천): `git clone` + python만.** GPU/클러스터 불필요(순수 분석). 어디서든 OK.
+  예: `python planner/perf_planner.py --model <hf> --in-len 512 --out-len 256 --n-req 64`,
+  `python planner/verify_vs_baseline.py`, `python planner/check_consistency.py`.
+- **측정 재현**: 이 이종 클러스터 그대로 필요(head=vllm_main env, worker=vllm_new env, /scfs 공유,
+  ray 재구성은 `rerun_layout_sweeps2.sh` reconfig() = head local + worker SSH). 다른 하드웨어선 불가.
+- **새 에이전트**: 이 파일 + `RESULTS_PACKAGE/docs/SERVING_PLANNER_EXPLAINED.md` + `planner_describe.md`
+  읽으면 전체 이해 가능. (이 세션 메모리는 이 머신에만 있음 — 새 에이전트는 fresh 시작.)
+
+## 다음 할 일 후보
+- 123b/큰모델 2+2/1+1 추가(현재 메모리상 4GPU/2GPU 안 들어감), MoE 프리필 정확도, EP 축 추가(DeepSeek류),
+  유효 AR 동시성 모델화(2번째 MHA 필요), 논문 본문(`paper/main.tex`) fresh 수치로 갱신.
+
+---
+
 ## 큰 그림
 4+4 cross-node 클러스터(head=4×Blackwell 96GB, worker=4×Ada 48GB, IB)에서
 non-uniform TP/PP 서빙을 측정하고, 그 데이터로 **임의의 모델·하드웨어·워크로드에서

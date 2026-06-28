@@ -119,15 +119,12 @@ def main(hg=4, wg=4):
             # uplift % above the taller bar
             ax.text(j, max(base[j], plan[j]) + top * 0.02, f"{u:+.0f}%", ha="center",
                     fontsize=11, fontweight="bold", color="#137333" if u >= 0 else "#c5221f")
-            # the planner-picked config, INSIDE the blue bar, horizontal + white, readable
-            if plan[j] > top * 0.16:
-                ax.text(j + w / 2, plan[j] * 0.5, picks[j].replace("  ", "\n"), ha="center",
-                        va="center", rotation=90, fontsize=8.5, color="white", fontweight="bold")
         ax.set_xticks(x); ax.set_xticklabels([f"n={n_}" for n_ in ns], fontsize=11)
-        ax.set_ylim(0, top * 1.30)
+        ax.set_ylim(0, top * 1.26)
         ax.set_title(title, fontweight="bold", fontsize=13)
         ax.set_ylabel("throughput (tok/s)"); ax.grid(axis="y", alpha=0.3)
-        ax.legend(fontsize=9, loc="upper left", framealpha=0.95)
+        # grey vs blue identified by the banner ("planner pick") + suptitle ("vs uniform
+        # baseline"); no legend / no in-bar text (the split is in the banner).
         # prominent banner: which non-uniform config the planner recommends
         uniq = list(dict.fromkeys(picks))
         if len(uniq) == 1:
