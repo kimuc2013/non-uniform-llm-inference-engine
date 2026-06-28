@@ -61,11 +61,25 @@ def method(e):
     return head
 
 
-# fixed method order (high TP -> low) and stable colors so panels are comparable
+# fixed method order (high TP -> low). Colors are PAIRED by topology: the uniform
+# method gets a saturated hue, its non-uniform variant the same hue lighter, so
+# related methods read together. The uniform-TP=world baseline is drawn grey+hatch.
 METHOD_ORDER = ["TP8", "TP8 FFN-bias", "TP4xPP2", "TP4xPP2 skew", "TP2xPP4", "TP2xPP4 skew",
                 "TP1xPP8", "TP4", "TP4 FFN-bias", "TP2xPP2", "TP2xPP2 skew", "TP1xPP4",
                 "TP2", "TP2 FFN-bias", "TP1xPP2", "TP1xPP2 skew"]
-METHOD_COLOR = {m: c for m, c in zip(METHOD_ORDER, plt.cm.tab20(np.linspace(0, 1, 20)))}
+METHOD_COLOR = {
+    # red = pure high-TP; blue = TPxPP2; green = deeper PP; purple = full PP
+    "TP8": "#ea4335",     "TP8 FFN-bias": "#f7b4ad",
+    "TP4xPP2": "#1a73e8", "TP4xPP2 skew": "#9fc3fa",
+    "TP2xPP4": "#137333", "TP2xPP4 skew": "#84caa0",
+    "TP1xPP8": "#a142f4",
+    "TP4": "#ea4335",     "TP4 FFN-bias": "#f7b4ad",
+    "TP2xPP2": "#1a73e8", "TP2xPP2 skew": "#9fc3fa",
+    "TP1xPP4": "#137333",
+    "TP2": "#ea4335",     "TP2 FFN-bias": "#f7b4ad",
+    "TP1xPP2": "#1a73e8", "TP1xPP2 skew": "#9fc3fa",
+}
+BASE_GREY = "#9aa0a6"
 
 
 def plot_layout(hg, wg, workload="balanced"):
@@ -101,9 +115,10 @@ def plot_layout(hg, wg, workload="balanced"):
         for k, m in enumerate(methods):
             ys = [bym[m].get(nr, 0) for nr in ns]
             base = (m == f"TP{world}")            # uniform TP=world is the baseline
-            ax.bar(x + (k - (nm - 1) / 2) * w, ys, w, color=METHOD_COLOR.get(m, "#888"),
-                   edgecolor=("black" if (m == pickm or base) else "none"),
-                   linewidth=(1.8 if m == pickm else (1.0 if base else 0)),
+            ax.bar(x + (k - (nm - 1) / 2) * w, ys, w,
+                   color=(BASE_GREY if base else METHOD_COLOR.get(m, "#888")),
+                   edgecolor=("#202124" if m == pickm else ("#5f6368" if base else "none")),
+                   linewidth=(2.0 if m == pickm else (0.8 if base else 0)),
                    hatch=("///" if base else None), label=m)
         ax.set_xticks(x); ax.set_xticklabels([f"n={nr}" for nr in ns], fontsize=11)
         ax.set_title(f"{title}  ({hg}+{wg}, {workload})", fontweight="bold", fontsize=12)
@@ -113,10 +128,13 @@ def plot_layout(hg, wg, workload="balanced"):
         axes[j].set_visible(False)
     # single shared legend at the bottom (methods are consistent across panels)
     from matplotlib.patches import Patch
-    handles = [Patch(fc=METHOD_COLOR.get(m, "#888"), label=m) for m in
-               [mm for mm in METHOD_ORDER if mm in seen_methods]]
-    handles.append(Patch(fc="white", ec="black", hatch="///", label=f"(hatched = baseline TP{world})"))
-    handles.append(Patch(fc="white", ec="black", lw=1.8, label="(black edge = planner pick)"))
+    handles = []
+    for m in [mm for mm in METHOD_ORDER if mm in seen_methods]:
+        if m == f"TP{world}":
+            handles.append(Patch(fc=BASE_GREY, ec="#5f6368", hatch="///", label=f"{m}  (baseline)"))
+        else:
+            handles.append(Patch(fc=METHOD_COLOR.get(m, "#888"), label=m))
+    handles.append(Patch(fc="white", ec="#202124", lw=2.0, label="black edge = planner pick"))
     fig.legend(handles=handles, loc="lower center", ncol=min(6, len(handles)), fontsize=9,
                frameon=True, bbox_to_anchor=(0.5, 0.0))
     fig.suptitle(f"Per-model parallelization comparison — {workload}, {hg}+{wg}   "
