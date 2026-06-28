@@ -47,8 +47,25 @@ def cells(model, hg, wg, workload="balanced"):
     return out
 
 
-def _tp_of(lab):
-    return int(lab.split("TP")[1].split("x")[0].split(" ")[0])
+def method(e):
+    """Parallelization METHOD (topology + uniform/non-uniform type), collapsing skew
+    degrees so methods are comparable: 'TP8', 'TP8 FFN-bias', 'TP4xPP2',
+    'TP4xPP2 skew', 'TP2xPP4', 'TP2xPP4 skew', 'TP1xPP8'."""
+    tp, pp = e["tp"], e["pp"]
+    head = f"TP{tp}" + (f"xPP{pp}" if pp > 1 else "")
+    ls, ffn = e.get("layer_split", []), e.get("ffn_splits", [])
+    if pp > 1 and ls and max(ls) - min(ls) > 1:
+        return head + " skew"
+    if pp == 1 and ffn and max(ffn) != min(ffn):
+        return head + " FFN-bias"
+    return head
+
+
+# fixed method order (high TP -> low) and stable colors so panels are comparable
+METHOD_ORDER = ["TP8", "TP8 FFN-bias", "TP4xPP2", "TP4xPP2 skew", "TP2xPP4", "TP2xPP4 skew",
+                "TP1xPP8", "TP4", "TP4 FFN-bias", "TP2xPP2", "TP2xPP2 skew", "TP1xPP4",
+                "TP2", "TP2 FFN-bias", "TP1xPP2", "TP1xPP2 skew"]
+METHOD_COLOR = {m: c for m, c in zip(METHOD_ORDER, plt.cm.tab20(np.linspace(0, 1, 20)))}
 
 
 def plot_layout(hg, wg, workload="balanced"):
@@ -57,43 +74,54 @@ def plot_layout(hg, wg, workload="balanced"):
     if not data:
         return
     n = len(data); ncols = min(3, n); nrows = math.ceil(n / ncols)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 6.2, nrows * 4.8), squeeze=False)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 6.0, nrows * 4.7), squeeze=False)
     axes = axes.flatten()
+    seen_methods = []
     for i, (mk, title) in enumerate(data):
         ax = axes[i]
         es = cells(mk, hg, wg, workload)
         ns = sorted({e["n_req"] for e in es})
-        bycfg = defaultdict(dict)               # label -> {n_req: tps}
+        # best tps per (method, n_req) — collapses skew+8/+12 into the best 'skew'
+        bym = defaultdict(dict)
         for e in es:
-            bycfg[label(e)][e["n_req"]] = e["tps"]
-        # order x: by TP degree desc, uniform before non-uniform within a topology
-        cfgs = sorted(bycfg, key=lambda l: (-_tp_of(l), ("L=" in l or "FFN" in l), l))
-        # planner pick (at the highest concurrency)
+            m = method(e); bym[m][e["n_req"]] = max(bym[m].get(e["n_req"], 0), e["tps"])
+        methods = [m for m in METHOD_ORDER if m in bym]
+        for m in methods:
+            if m not in seen_methods:
+                seen_methods.append(m)
+        # planner-pick topology (highest concurrency)
         hw = relayout(hg, wg)
         r = P.plan(P.MODELS[mk], hw, P.Workload(es[0]["in_len"], es[0]["out_len"], max(ns)), top_k=1)
-        pick = (f"TP{r[0][1].tp}" + (f"x PP{r[0][1].pp}" if r[0][1].pp > 1 else "")) if r else None
-        # grouped bars: one group per config, one bar per concurrency
-        x = np.arange(len(cfgs)); nb = len(ns); w = 0.82 / nb
-        cols = plt.cm.viridis(np.linspace(0.12, 0.82, nb))
-        for k, nr in enumerate(ns):
-            ys = [bycfg[c].get(nr, 0) for c in cfgs]
-            ax.bar(x + (k - (nb - 1) / 2) * w, ys, w, color=cols[k], label=f"n={nr}")
-        ax.set_xticks(x)
-        ticklabs = ax.set_xticklabels(cfgs, rotation=35, ha="right", fontsize=8)
-        for t, c in zip(ticklabs, cfgs):     # highlight baseline (grey) + planner pick (blue)
-            if c == f"TP{world} (uniform)":
-                t.set_color("#5f6368"); t.set_fontweight("bold")
-            elif pick and c.startswith(pick) and ("L=" in c or "FFN" in c):
-                t.set_color("#174ea6"); t.set_fontweight("bold")
+        pickm = None
+        if r:
+            c = r[0][1]; pickm = method({"tp": c.tp, "pp": c.pp,
+                "layer_split": c.layer_split, "ffn_splits": c.ffn_splits})
+        # GROUP BY BATCH: x = concurrency, one bar per method  -> compare methods per batch
+        x = np.arange(len(ns)); nm = len(methods); w = 0.86 / nm
+        for k, m in enumerate(methods):
+            ys = [bym[m].get(nr, 0) for nr in ns]
+            base = (m == f"TP{world}")            # uniform TP=world is the baseline
+            ax.bar(x + (k - (nm - 1) / 2) * w, ys, w, color=METHOD_COLOR.get(m, "#888"),
+                   edgecolor=("black" if (m == pickm or base) else "none"),
+                   linewidth=(1.8 if m == pickm else (1.0 if base else 0)),
+                   hatch=("///" if base else None), label=m)
+        ax.set_xticks(x); ax.set_xticklabels([f"n={nr}" for nr in ns], fontsize=11)
         ax.set_title(f"{title}  ({hg}+{wg}, {workload})", fontweight="bold", fontsize=12)
-        ax.set_ylabel("throughput (tok/s)"); ax.grid(axis="y", alpha=0.3)
-        ax.legend(fontsize=8, title="concurrency", loc="upper right", framealpha=0.92)
+        ax.set_xlabel("concurrent requests (batch)"); ax.set_ylabel("throughput (tok/s)")
+        ax.grid(axis="y", alpha=0.3)
     for j in range(n, len(axes)):
         axes[j].set_visible(False)
-    fig.suptitle(f"Per-model parallelization — {workload}, {hg}+{wg}   "
-                 f"(grouped bars = concurrency; x-label grey-bold = uniform-TP{world} baseline, "
-                 f"blue-bold = planner pick)", fontsize=12)
-    plt.tight_layout()
+    # single shared legend at the bottom (methods are consistent across panels)
+    from matplotlib.patches import Patch
+    handles = [Patch(fc=METHOD_COLOR.get(m, "#888"), label=m) for m in
+               [mm for mm in METHOD_ORDER if mm in seen_methods]]
+    handles.append(Patch(fc="white", ec="black", hatch="///", label=f"(hatched = baseline TP{world})"))
+    handles.append(Patch(fc="white", ec="black", lw=1.8, label="(black edge = planner pick)"))
+    fig.legend(handles=handles, loc="lower center", ncol=min(6, len(handles)), fontsize=9,
+               frameon=True, bbox_to_anchor=(0.5, 0.0))
+    fig.suptitle(f"Per-model parallelization comparison — {workload}, {hg}+{wg}   "
+                 f"(grouped by batch; each bar = a parallelization method)", fontsize=13)
+    plt.tight_layout(rect=[0, 0.07, 1, 1])
     p = OUT / f"per_model_configs_{hg}x{wg}_{workload}.png"
     fig.savefig(p, dpi=140, bbox_inches="tight"); plt.close(fig)
     print(f"saved {p}  ({n} models)")

@@ -139,7 +139,12 @@ def main(hg=4, wg=4):
     fig.suptitle(f"Planner (raw top-1 pick) vs naive baseline (uniform TP{world}) — "
                  f"balanced, {hg}+{wg}, n>=32  (qwen3-32B excluded — fork PP-overlap gap, §8)",
                  fontsize=13)
-    plt.tight_layout()
+    # shared legend at the BOTTOM (so it never overlaps the per-panel planner-pick box)
+    from matplotlib.patches import Patch
+    fig.legend(handles=[Patch(fc="#bdc1c6", ec="#80868b", label=f"baseline — uniform TP{world}"),
+                        Patch(fc="#1a73e8", ec="#174ea6", label="planner pick (config in box above each panel)")],
+               loc="lower center", ncol=2, fontsize=11, frameon=True, bbox_to_anchor=(0.5, 0.0))
+    plt.tight_layout(rect=[0, 0.05, 1, 1])
     p = OUT / f"planner_vs_baseline_uplift_{hg}x{wg}.png"
     fig.savefig(p, dpi=140, bbox_inches="tight"); plt.close(fig)
     print(f"saved {p}  ({nrows}x{ncols} grid, {n} models)")
