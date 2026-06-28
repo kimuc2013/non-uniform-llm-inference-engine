@@ -49,13 +49,18 @@ def balanced_cells(model, hg, wg):
 
 
 def pick_label(scfg):
-    """Compact label for the planner's recommended config, e.g. 'TP4PP2 skew', 'TP2 bias'."""
-    head = f"TP{scfg.tp}" + (f"PP{scfg.pp}" if scfg.pp > 1 else "")
+    """Label showing HOW the non-uniform split was done (Blackwell-side first, Ada last):
+      'TP4xPP2  L=24-8'     PP layer skew (fast node 24 layers, slow node 8)
+      'TP8  FFN 2688:896'   TP FFN-column bias (Blackwell 2688, Ada 896)
+      'TP4xPP2' / 'TP8'     uniform."""
+    head = f"TP{scfg.tp}" + (f"xPP{scfg.pp}" if scfg.pp > 1 else "")
     if scfg.pp > 1:
-        tag = "unif" if (max(scfg.layer_split) - min(scfg.layer_split)) <= 1 else "skew"
-    else:
-        tag = "unif" if max(scfg.ffn_splits) == min(scfg.ffn_splits) else "bias"
-    return f"{head} {tag}"
+        if max(scfg.layer_split) - min(scfg.layer_split) <= 1:
+            return head
+        return f"{head}  L={'-'.join(map(str, scfg.layer_split))}"
+    if max(scfg.ffn_splits) == min(scfg.ffn_splits):
+        return head
+    return f"{head}  FFN {scfg.ffn_splits[0]}:{scfg.ffn_splits[-1]}"
 
 
 def collect_model(mk, hg, wg, world, hw):
@@ -105,21 +110,33 @@ def main(hg=4, wg=4):
     axes = axes.flatten()
     for i, (mk, title, ns, base, plan, uplift, picks) in enumerate(data):
         ax = axes[i]
-        x = np.arange(len(ns)); w = 0.38
-        ax.bar(x - w / 2, base, w, label=f"baseline: TP{world} uniform", color="#9aa0a6")
-        ax.bar(x + w / 2, plan, w, label="planner pick (config below)", color="#1a73e8")
+        x = np.arange(len(ns)); w = 0.40
+        ax.bar(x - w / 2, base, w, label=f"baseline — uniform TP{world}", color="#bdc1c6",
+               edgecolor="#80868b")
+        ax.bar(x + w / 2, plan, w, label="planner pick", color="#1a73e8", edgecolor="#174ea6")
         top = max(max(base), max(plan))
         for j, u in enumerate(uplift):
-            ax.text(j, max(base[j], plan[j]) + top * 0.015, f"{u:+.0f}%", ha="center",
-                    fontsize=10, fontweight="bold", color="#137333" if u >= 0 else "#c5221f")
-            # planner's recommended config under its bar
-            ax.text(j + w / 2, top * 0.03, picks[j], ha="center", va="bottom", rotation=90,
-                    fontsize=8, color="#1a73e8", fontweight="bold")
-        ax.set_xticks(x); ax.set_xticklabels([f"n={n_}" for n_ in ns])
-        ax.set_ylim(0, top * 1.18)
+            # uplift % above the taller bar
+            ax.text(j, max(base[j], plan[j]) + top * 0.02, f"{u:+.0f}%", ha="center",
+                    fontsize=11, fontweight="bold", color="#137333" if u >= 0 else "#c5221f")
+            # the planner-picked config, INSIDE the blue bar, horizontal + white, readable
+            if plan[j] > top * 0.16:
+                ax.text(j + w / 2, plan[j] * 0.5, picks[j].replace("  ", "\n"), ha="center",
+                        va="center", rotation=90, fontsize=8.5, color="white", fontweight="bold")
+        ax.set_xticks(x); ax.set_xticklabels([f"n={n_}" for n_ in ns], fontsize=11)
+        ax.set_ylim(0, top * 1.30)
         ax.set_title(title, fontweight="bold", fontsize=13)
         ax.set_ylabel("throughput (tok/s)"); ax.grid(axis="y", alpha=0.3)
-        ax.legend(fontsize=8, loc="upper left")
+        ax.legend(fontsize=9, loc="upper left", framealpha=0.95)
+        # prominent banner: which non-uniform config the planner recommends
+        uniq = list(dict.fromkeys(picks))
+        if len(uniq) == 1:
+            banner = f"planner pick:  {uniq[0]}"
+        else:
+            banner = "planner pick:  " + " | ".join(f"n{n}: {p}" for n, p in zip(ns, picks))
+        ax.text(0.5, 0.99, banner, transform=ax.transAxes, ha="center", va="top",
+                fontsize=9.5, color="#174ea6", fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.35", fc="#e8f0fe", ec="#1a73e8", lw=1.2))
     for j in range(n, len(axes)):   # hide any trailing unused cell
         axes[j].set_visible(False)
     fig.suptitle(f"Planner (raw top-1 pick) vs naive baseline (uniform TP{world}) — "
