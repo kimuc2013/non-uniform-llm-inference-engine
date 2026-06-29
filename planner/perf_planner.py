@@ -225,7 +225,10 @@ def load_hardware(path: Path = HW_PARAMS) -> HardwareSpec:
                   nvlink_ar_bw_gbs=intra2["nvlink_ar_bw_gbs"],
                   nvlink_ar_latency_us=intra2["nvlink_ar_latency_us"],
                   kv_bw_scale=m.get("kv_bw_scale", 1.0))
-        measured_keys = {"ar_latency_us", "ar_bw_gbs", "intra_ar_latency_us", "kv_bw_scale"}
+        # ar_bw_gbs is NOT a measured key: the calibrate file carries only the isolated
+        # AR anchor, while the EFFECTIVE in-serving AR bandwidth is fit from serving
+        # (fit_planner.py) — so the fit, not the isolated bench, owns ar_bw_gbs.
+        measured_keys = {"ar_latency_us", "intra_ar_latency_us", "kv_bw_scale"}
         if "iso_ar_surface" in m:
             global _ISO_AR_SURFACE, _ISO_AR_REF
             _ISO_AR_SURFACE = {int(k): [tuple(p) for p in v] for k, v in m["iso_ar_surface"].items()}
@@ -387,11 +390,17 @@ def t_allreduce_ms(msg_bytes: float, ranks: list, hw: HardwareSpec) -> float:
     # inter-node volume on the bottleneck NIC is 2(n_nodes-1)/n_nodes·msg (the
     # /n_local of per-GPU traffic cancels against n_local GPUs sharing the NIC).
     t_intra = (2 * (n_local - 1) / n_local * msg_bytes) / (hw.intra_ar_bw_gbs * 1e9) * 1e3
-    # Inter-node bandwidth is a measured surface over (n_local, message): it
-    # degrades with n_local (Ada-side PCIe/NIC contention) AND opens up above the
-    # NCCL LL->Simple threshold (~1 MB). ar_bw_gbs anchors the n_local=4 @ ~1 MB
-    # point; everything else scales by the measured ratio to that anchor.
-    eff_ar_bw = hw.ar_bw_gbs * _iso_ar_bw(n_local, msg_bytes / 1e6) / _ISO_AR_REF
+    # Inter-node bandwidth is RADIX-INDEPENDENT: the per-node IB volume is
+    # 2(n_nodes-1)/n_nodes·msg regardless of n_local (the /n_local per-GPU traffic
+    # cancels against n_local GPUs sharing the ONE per-node NIC, see above), and the
+    # NIC bandwidth does not change with how many local GPUs feed it. So the cost is
+    # set by a single measured per-node IB bandwidth + the message-size curve (the
+    # NCCL LL->Simple opening near ~1 MB). The isolated microbench's apparent low-radix
+    # speedup (n_local=2 ≈ 4× n_local=4) was an LL-protocol artifact that does NOT
+    # survive in serving (per-node-NIC bottleneck) — it mispriced 2+2 cross-node TP4.
+    # We therefore take the message-size shape from the anchor radix only (radix-free).
+    _anchor_n = max(_ISO_AR_SURFACE)
+    eff_ar_bw = hw.ar_bw_gbs * _row_bw(_ISO_AR_SURFACE[_anchor_n], msg_bytes / 1e6) / _ISO_AR_REF
     t_inter = (2 * (n_nodes - 1) / n_nodes * msg_bytes) / (eff_ar_bw * 1e9) * 1e3
     lat = 2 * (n_nodes - 1) * hw.ar_latency_us + 2 * (n_local - 1) * hw.intra_ar_latency_us
     return t_intra + t_inter + lat / 1e3

@@ -32,13 +32,43 @@ def main():
         print(f"# world={world}  mode={'HIDDEN-sweep@batch=%d' % SWEEP_BATCH if SWEEP_HIDDEN else 'BATCH-sweep@hidden=%d' % HIDDEN}")
         print(f"# {'batch':>6} {'hidden':>6} {'msg_MB':>8} {'AR_ms':>8} {'lat_us/AR':>10} {'algbw_GB/s':>11}")
     use_graph = os.environ.get("AR_CUDA_GRAPH", "0") == "1"
-    if rank == 0 and use_graph:
-        print("# (CUDA-graph capture: launch overhead removed — in-decode-representative)")
+    # AR_PIPELINE=K: measure SUSTAINED (pipelined) AR bandwidth — K independent
+    # all-reduces queued back-to-back with NO inter-dependency (distinct buffers),
+    # synced once. This is in-decode-representative: real decode keeps several AR
+    # kernels in flight, so the IB link stays busier than a single serialized AR.
+    # The serialized loop below (reused buffer) is the ISOLATED lower bound; the
+    # gap between them is the in-decode pipeline-concurrency boost — measured, not a constant.
+    K = int(os.environ.get("AR_PIPELINE", "0"))
+    if rank == 0:
+        if use_graph:
+            print("# (CUDA-graph capture: launch overhead removed)")
+        if K > 0:
+            print(f"# (PIPELINE mode: {K} independent in-flight all-reduces, sustained algbw)")
     for b, hid in configs:
         x = torch.randn(b, hid, dtype=torch.bfloat16, device=dev)
         for _ in range(15):
             dist.all_reduce(x)
         torch.cuda.synchronize(); dist.barrier()
+        if K > 0:
+            # distinct buffers -> no data dependency -> NCCL/IB can pipeline them
+            bufs = [torch.randn(b, hid, dtype=torch.bfloat16, device=dev) for _ in range(K)]
+            for _ in range(3):
+                for buf in bufs:
+                    dist.all_reduce(buf)
+            torch.cuda.synchronize(); dist.barrier()
+            ITERS = 30
+            s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+            s.record()
+            for _ in range(ITERS):
+                for buf in bufs:
+                    dist.all_reduce(buf)
+            e.record(); torch.cuda.synchronize()
+            t_ms = s.elapsed_time(e) / (ITERS * K)        # per-AR sustained
+            if rank == 0:
+                msg = b * hid * 2
+                algbw = msg / (t_ms / 1e3) / 1e9
+                print(f"  {b:>6} {hid:>6} {msg/1e6:8.3f} {t_ms:8.3f} {t_ms*1e3:10.1f} {algbw:11.1f}")
+            continue
         if use_graph:
             # capture one all-reduce in a CUDA graph, replay it (no per-call launch)
             sstream = torch.cuda.Stream()

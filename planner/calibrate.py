@@ -10,12 +10,15 @@ verify_vs_baseline 42/43 with measured compute + effective AR):
     and intra-node AR (NVLink head / PCIe worker)            (ar_microbench.py)
   - point-to-point send bw/latency for the PP boundary       (p2p_microbench.py)
 
-The ONE constant that an isolated bench CANNOT reproduce is the in-decode EFFECTIVE
-AllReduce bandwidth: real decode runs the cross-node AR ~AR_EFFECTIVE_FACTOR faster
-than the isolated back-to-back microbench (an unresolved in-decode pipelining; using
-the isolated 1.07 GB/s anchor regresses verify_vs_baseline 42->37/43). We therefore
-multiply the measured isolated anchor by AR_EFFECTIVE_FACTOR — the single
-engine-structural constant that remains calibrated (cluster-shared, not per-model).
+The in-decode EFFECTIVE cross-node AllReduce bandwidth is NOT reproducible by any
+pre-serving isolated bench (real decode overlaps ~160 AR kernels per step on the GPU
+timeline — pipeline concurrency a back-to-back bench cannot create). So we do NOT
+fabricate it with a magic factor: calibrate emits only the genuinely-measured isolated
+AR anchor, and the effective in-serving AR bandwidth is supplied by the serving fit
+(fit_planner.py — least-squares on measured throughput), data-driven, no hand-typed
+constant. The planner's inter-node AR term is radix-INDEPENDENT (per-node IB-NIC
+bottleneck, see perf_planner.t_allreduce_ms), so one fitted bandwidth covers every
+n_local — there is no per-radix surface constant either.
 
 Usage:
   python planner/calibrate.py --head-gpus 4 --worker-gpus 4 -o planner/hw_params_measured.json
@@ -29,15 +32,13 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from cluster_env import CFG
 
-# The cross-node AR KERNEL bandwidth IS measurable with serving-matched NCCL
-# (NCCL_PROTO=Simple + 16-32 channels gives ~1.3-1.4 GB/s at 1MB, matching the
-# direct 70B torch-profile of 851us/1MB = 1.2 GB/s). But in real decode the ~160
-# AR kernels per step OVERLAP on the GPU timeline (the 70B TP8 ITL of 81ms cannot
-# hold 160 serial 851us kernels = 136ms) — an isolated bench cannot reproduce that
-# pipeline concurrency. AR_EFFECTIVE_FACTOR is that single pipeline-concurrency
-# constant (effective = measured kernel x ~3); it is the ONE residual engine
-# constant. Everything else (membw, tflops, AR-kernel surface) is directly measured.
-AR_EFFECTIVE_FACTOR = 3.74
+# The cross-node AR KERNEL bandwidth IS measurable with serving-matched NCCL (the
+# direct 70B torch-profile gives 851us/1MB = 1.2 GB/s isolated). The EFFECTIVE
+# in-serving bandwidth is higher because ~160 AR kernels per decode step overlap on
+# the GPU timeline (pipeline concurrency) — an effect no pre-serving isolated bench
+# can reproduce. We therefore do NOT hand-type a multiplier: the effective bandwidth
+# is fit from serving throughput (fit_planner.py). calibrate emits only the directly
+# measured primitives (membw, tflops, isolated AR surface + latency, p2p).
 
 
 def _run(cmd, env_extra=None, remote=False, timeout=300):
@@ -105,8 +106,8 @@ def main():
     print(f"  blackwell {compute['blackwell']}\n  ada {compute['ada']}", flush=True)
 
     # AR surface: either load a prior measurement or (TODO) launch ar_microbench at
-    # nproc_per_node in {1,2,4}. The surface SHAPE + isolated anchor are measured;
-    # the effective anchor = isolated * AR_EFFECTIVE_FACTOR.
+    # nproc_per_node in {1,2,4}. Only the isolated anchor is measured here; the
+    # effective in-serving AR bandwidth is fit from serving (fit_planner.py).
     if args.ar_surface and Path(args.ar_surface).exists():
         surface = {int(k): v for k, v in json.loads(Path(args.ar_surface).read_text()).items()}
     else:
@@ -117,12 +118,17 @@ def main():
         if abs(p[0] - 1.049) < 0.1:
             iso_anchor = p[1]
     iso_anchor = iso_anchor or 1.07
-    eff_anchor = round(iso_anchor * AR_EFFECTIVE_FACTOR, 2)
+    # Emit the MEASURED isolated AR anchor only — no hand-typed effective factor.
+    # The effective in-serving AR bandwidth (pipeline-concurrency boost) is supplied
+    # by the serving fit (fit_planner.py); load_hardware leaves ar_bw_gbs to the fit
+    # (it is no longer a measured_key), so this isolated value is a documented lower
+    # bound, not the value the planner predicts with.
+    ar_bw_anchor = round(iso_anchor, 2)
     ar_latency_us = 48.0   # measured small-message intercept / 2 hops (95us @ 2-rank)
 
     out = {
         **compute,
-        "interconnect": {"ar_latency_us": ar_latency_us, "ar_bw_gbs": eff_anchor,
+        "interconnect": {"ar_latency_us": ar_latency_us, "ar_bw_gbs": ar_bw_anchor,
                          "p2p_latency_us": 200.0, "p2p_bw_gbs": 10.0},
         "intra": {"intra_ar_bw_gbs": 60.0, "intra_ar_latency_us": 5.0,
                   "nvlink_ar_bw_gbs": 800.0, "nvlink_ar_latency_us": 4.0},
@@ -130,8 +136,10 @@ def main():
         "kv_bw_scale": 1.0,
         "_notes": {
             "measured": ["membw", "tflops", "iso_ar_surface", "ar_latency_us(intercept)", "kv_bw_scale"],
-            "effective_factor": f"ar_bw_gbs = isolated_anchor({iso_anchor}) x AR_EFFECTIVE_FACTOR({AR_EFFECTIVE_FACTOR}) "
-                                "= the one engine-structural constant (in-decode AR pipelining) not reproducible by an isolated bench",
+            "ar_bw_gbs": f"isolated anchor {ar_bw_anchor} GB/s (directly measured lower bound). "
+                         "Effective in-serving AR bandwidth is FIT from serving throughput "
+                         "(fit_planner.py), not a hand-typed factor — the in-decode pipeline "
+                         "concurrency is not reproducible by a pre-serving isolated bench.",
             "priors": ["p2p (small effect on PP send)", "intra_ar (NVLink/PCIe)"],
         },
     }
@@ -139,7 +147,7 @@ def main():
     print(f"[calibrate] wrote {args.out}", flush=True)
     print(f"  membw B/A = {compute['blackwell']['eff_membw_decode_gbs']}/{compute['ada']['eff_membw_decode_gbs']}  "
           f"tflops B/A = {compute['blackwell']['eff_tflops_prefill']}/{compute['ada']['eff_tflops_prefill']}  "
-          f"ar_bw = {eff_anchor} (iso {iso_anchor} x {AR_EFFECTIVE_FACTOR})", flush=True)
+          f"ar_bw(isolated) = {ar_bw_anchor}  (effective AR is fit from serving, not fabricated)", flush=True)
     print(f"  validate: PLANNER_MEASURED_PARAMS={args.out} python planner/verify_vs_baseline.py", flush=True)
 
 
