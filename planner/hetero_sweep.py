@@ -43,7 +43,13 @@ MODEL_MAX_LEN = {"opt30b": 2048}
 # endpoint, so give them a trivial pass-through template (content concatenation).
 NEEDS_CHAT_TEMPLATE = {"opt30b"}
 CHAT_TEMPLATE_FILE = REPO / "planner" / "base_chat_template.jinja"
-WORKLOAD_SHAPE = {"balanced": (512, 256), "decode_heavy": (128, 512), "prefill_heavy": (1024, 128)}
+WORKLOAD_SHAPE = {"balanced": (512, 256), "decode_heavy": (128, 512), "prefill_heavy": (1024, 128),
+    # input/output-context robustness grid (in_len, out_len; total <= 4096 to fit max-model-len)
+    "in128_out128": (128, 128),     "in128_out1024": (128, 1024),
+    "in1024_out128": (1024, 128),   "in2048_out256": (2048, 256),
+    "in512_out1024": (512, 1024),   "in2048_out512": (2048, 512),
+    "in3072_out512": (3072, 512),   "in256_out512": (256, 512),
+    "mixed": (-1, -1)}              # MIXED traffic: varied shapes per request (perf/mixed_bench.py)
 
 
 # ----------------------------------------------------------------------------
@@ -200,6 +206,31 @@ def wait_ready(log_path, port, timeout=4200):
 
 def run_perf(model, port, in_len, out_len, n_req, out_dir, timeout=900):
     out_dir.mkdir(parents=True, exist_ok=True)
+    if in_len < 0:      # MIXED-traffic workload: perf/mixed_bench.py sends varied shapes
+        sp = out_dir / "perf_summary.csv"
+        # cap (in+out): OPT-30B has a 2048 context window; 70B/123B would OOM the
+        # Ada ranks' KV at high concurrency with very long inputs.
+        mt = 1900 if ("opt-30b" in model or "70B" in model or "Large" in model) else 4096
+        cmd = [PY, str(REPO / "perf" / "mixed_bench.py"), "--base-url",
+               f"http://127.0.0.1:{port}/v1", "--model", model, "--n-req", str(n_req),
+               "--seed", "0", "--max-total", str(mt), "--summary-csv", str(sp)]
+        env = os.environ.copy()
+        env["PATH"] = f"{Path(CFG.head_py).parent}:" + env.get("PATH", "")
+        env["HF_HUB_OFFLINE"] = "1"; env["TRANSFORMERS_OFFLINE"] = "1"
+        with (out_dir / "perf.log").open("w") as f:
+            try:
+                ok = subprocess.run(cmd, env=env, cwd=str(REPO), stdout=f,
+                                    stderr=subprocess.STDOUT, timeout=timeout, check=False).returncode == 0
+            except subprocess.TimeoutExpired:
+                ok = False
+        res = {"perf_ok": ok}
+        if sp.exists():
+            for line in sp.read_text().splitlines():
+                if "," in line and not line.startswith("metric"):
+                    k, _, v = line.partition(",")
+                    try: res[k.strip()] = float(v.strip())
+                    except Exception: pass
+        return res
     prompt = out_dir / "prompt.txt"
     base = ("The following is a detailed analysis of large language model inference "
             "systems with a focus on heterogeneous GPU clusters. ").split()

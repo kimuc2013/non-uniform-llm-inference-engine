@@ -9,7 +9,7 @@ HG=$1; WG=$2; shift 2
 MODELS="$@"
 CONFIGS="${CAMPAIGN_CONFIGS:-uniform,skew+8,skew+12,ffn_bias+50}"
 WL="${CAMPAIGN_WORKLOADS:-balanced,decode_heavy,prefill_heavy}"
-NREQ="16,32,64,96"
+NREQ="${CAMPAIGN_NREQ:-16,32,64,96}"
 LOG=/scfs/esca/campaign_${HG}x${WG}.log
 
 echo "================ CAMPAIGN ${HG}+${WG}  models=[$MODELS]  start $(date) ================" | tee -a "$LOG"
