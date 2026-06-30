@@ -19,6 +19,8 @@ REPO = Path(__file__).resolve().parents[1]
 OUT = REPO / "figures" / "per_model_configs"; OUT.mkdir(parents=True, exist_ok=True)
 MODELS = [("8b", "Llama-8B"), ("70b", "Llama-70B"), ("opt30b", "OPT-30B"),
           ("mistral123b", "Mistral-123B"), ("mixtral8x7b", "Mixtral-8x7B")]
+# mean (in,out) of the mixed-traffic shape mix (for the planner-pick overlay only)
+MIXED_MEAN = {"8b": (1080, 483), "opt30b": (597, 540), "70b": (597, 540)}
 
 
 def label(e):
@@ -103,9 +105,14 @@ def plot_layout(hg, wg, workload="balanced"):
         for m in methods:
             if m not in seen_methods:
                 seen_methods.append(m)
-        # planner-pick topology (highest concurrency)
+        # planner-pick topology (highest concurrency). Mixed traffic has no fixed
+        # (in,out) per cell (es[0]["in_len"]=-1) -> use the mean of the shape mix.
         hw = relayout(hg, wg)
-        r = P.plan(P.MODELS[mk], hw, P.Workload(es[0]["in_len"], es[0]["out_len"], max(ns)), top_k=1)
+        if workload == "mixed":
+            il, ol = MIXED_MEAN.get(mk, (512, 512))
+        else:
+            il, ol = es[0]["in_len"], es[0]["out_len"]
+        r = P.plan(P.MODELS[mk], hw, P.Workload(il, ol, max(ns)), top_k=1)
         pickm = None
         if r:
             c = r[0][1]; pickm = method({"tp": c.tp, "pp": c.pp,
@@ -147,5 +154,5 @@ def plot_layout(hg, wg, workload="balanced"):
 
 if __name__ == "__main__":
     for hg, wg in [(4, 4), (2, 2), (1, 1)]:
-        for wl in ["balanced", "decode_heavy", "prefill_heavy"]:
+        for wl in ["balanced", "decode_heavy", "prefill_heavy", "mixed"]:
             plot_layout(hg, wg, wl)
