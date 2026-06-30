@@ -64,7 +64,9 @@ def pick_label(scfg):
 
 
 def collect_model(mk, hg, wg, world, hw):
-    """Return (ns, base, plan, uplift, picks) for a model at this layout, or None if no data."""
+    """Return (ns, base_tp, base_pp, plan, uplift, picks) for a model at this layout,
+    or None if no data. base_tp = uniform TP{world}, base_pp = uniform TP1xPP{world}
+    (full pipeline); uplift = planner pick vs the BETTER of the two naive baselines."""
     cells = balanced_cells(mk, hg, wg)
     if not cells:
         return None
@@ -73,24 +75,28 @@ def collect_model(mk, hg, wg, world, hw):
     ns = [n for n in sorted(byn) if n >= 32]   # small batches are not a real cluster regime
     if not ns:
         return None
-    base = []; plan = []; uplift = []; picks = []
+    base = []; base_pp = []; plan = []; uplift = []; picks = []
     for n in ns:
         es = list({e["label"]: e for e in byn[n]}.values())
         w = P.Workload(es[0]["in_len"], es[0]["out_len"], n)
         b = [e for e in es if e["label"] == f"TP{world}PP1_uniform"]
         tp1 = [e for e in es if e["pp"] == 1]
         bt = b[0]["tps"] if b else (max(e["tps"] for e in tp1) if tp1 else max(e["tps"] for e in es))
+        bpp = [e for e in es if e["label"] == f"TP1PP{world}_uniform"]
+        bpt = bpp[0]["tps"] if bpp else 0.0           # uniform full-PP baseline (0 if not measured)
         # RAW planner top-1 (no safety guard), mapped to nearest measured config
         ranked = P.plan(P.MODELS[mk], hw, w, top_k=1)
         if not ranked:        # no feasible config at this layout (e.g. 123B won't fit on 2 GPUs)
-            base.append(bt); plan.append(bt); uplift.append(0.0); picks.append("—"); continue
+            base.append(bt); base_pp.append(bpt); plan.append(bt); uplift.append(0.0); picks.append("—"); continue
         scfg = ranked[0][1]
         same = [e for e in es if e["tp"] == scfg.tp and e["pp"] == scfg.pp]
         pt = (min(same, key=lambda e: sum(abs(a - x) for a, x in zip(e["layer_split"], scfg.layer_split))
                   + abs(e["ffn_splits"][0] - scfg.ffn_splits[0]) / 1000)["tps"] if same else bt)
-        base.append(bt); plan.append(pt); uplift.append((pt / bt - 1) * 100 if bt else 0)
+        best_base = max(bt, bpt)                       # the stronger naive homogeneous choice
+        base.append(bt); base_pp.append(bpt); plan.append(pt)
+        uplift.append((pt / best_base - 1) * 100 if best_base else 0)
         picks.append(pick_label(scfg))
-    return ns, base, plan, uplift, picks
+    return ns, base, base_pp, plan, uplift, picks
 
 
 def main(hg=4, wg=4):
@@ -108,17 +114,19 @@ def main(hg=4, wg=4):
     nrows = math.ceil(n / ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 5.6, nrows * 4.6), squeeze=False)
     axes = axes.flatten()
-    for i, (mk, title, ns, base, plan, uplift, picks) in enumerate(data):
+    for i, (mk, title, ns, base, base_pp, plan, uplift, picks) in enumerate(data):
         ax = axes[i]
-        x = np.arange(len(ns)); w = 0.40
-        ax.bar(x - w / 2, base, w, label=f"baseline — uniform TP{world}", color="#bdc1c6",
+        x = np.arange(len(ns)); w = 0.27
+        ax.bar(x - w, base, w, label=f"baseline (TP) — uniform TP{world}", color="#bdc1c6",
                edgecolor="#80868b")
-        ax.bar(x + w / 2, plan, w, label="planner pick", color="#1a73e8", edgecolor="#174ea6")
-        top = max(max(base), max(plan))
+        ax.bar(x, base_pp, w, label=f"baseline (PP) — uniform TP1xPP{world}", color="#5f6368",
+               edgecolor="#3c4043")
+        ax.bar(x + w, plan, w, label="planner pick", color="#1a73e8", edgecolor="#174ea6")
+        top = max(max(base), max(base_pp), max(plan))
         for j, u in enumerate(uplift):
-            # uplift % above the taller bar
-            ax.text(j, max(base[j], plan[j]) + top * 0.02, f"{u:+.0f}%", ha="center",
-                    fontsize=11, fontweight="bold", color="#137333" if u >= 0 else "#c5221f")
+            # uplift % (planner vs the BETTER baseline) above the planner bar
+            ax.text(j + w, plan[j] + top * 0.02, f"{u:+.0f}%", ha="center",
+                    fontsize=10.5, fontweight="bold", color="#137333" if u >= 0 else "#c5221f")
         ax.set_xticks(x); ax.set_xticklabels([f"n={n_}" for n_ in ns], fontsize=11)
         ax.set_ylim(0, top * 1.26)
         ax.set_title(title, fontweight="bold", fontsize=13)
@@ -136,19 +144,21 @@ def main(hg=4, wg=4):
                 bbox=dict(boxstyle="round,pad=0.35", fc="#e8f0fe", ec="#1a73e8", lw=1.2))
     for j in range(n, len(axes)):   # hide any trailing unused cell
         axes[j].set_visible(False)
-    fig.suptitle(f"Planner (raw top-1 pick) vs naive baseline (uniform TP{world}) — "
-                 f"balanced, {hg}+{wg}, n>=32  (qwen3-32B excluded — fork PP-overlap gap, §8)",
-                 fontsize=13)
+    fig.suptitle(f"Planner (raw top-1 pick) vs BOTH naive baselines — uniform TP{world} and "
+                 f"uniform TP1xPP{world} — balanced, {hg}+{wg}, n>=32  "
+                 f"(%; vs the better baseline; qwen3-32B excluded — fork PP-overlap gap, §8)",
+                 fontsize=12)
     # shared legend at the BOTTOM (so it never overlaps the per-panel planner-pick box)
     from matplotlib.patches import Patch
-    fig.legend(handles=[Patch(fc="#bdc1c6", ec="#80868b", label=f"baseline — uniform TP{world}"),
+    fig.legend(handles=[Patch(fc="#bdc1c6", ec="#80868b", label=f"baseline (TP) — uniform TP{world}"),
+                        Patch(fc="#5f6368", ec="#3c4043", label=f"baseline (PP) — uniform TP1xPP{world}"),
                         Patch(fc="#1a73e8", ec="#174ea6", label="planner pick (config in box above each panel)")],
-               loc="lower center", ncol=2, fontsize=11, frameon=True, bbox_to_anchor=(0.5, 0.0))
+               loc="lower center", ncol=3, fontsize=10.5, frameon=True, bbox_to_anchor=(0.5, 0.0))
     plt.tight_layout(rect=[0, 0.05, 1, 1])
     p = OUT / f"planner_vs_baseline_uplift_{hg}x{wg}.png"
     fig.savefig(p, dpi=140, bbox_inches="tight"); plt.close(fig)
     print(f"saved {p}  ({nrows}x{ncols} grid, {n} models)")
-    for mk, title, ns, base, plan, uplift, picks in data:
+    for mk, title, ns, base, base_pp, plan, uplift, picks in data:
         print(f"  [{hg}+{wg}] {mk:12s} " + " ".join(f"n{n}:{u:+.0f}%[{p}]" for n, u, p in zip(ns, uplift, picks)))
 
 

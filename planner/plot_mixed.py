@@ -48,9 +48,9 @@ def _draw_panel(ax, mk, hg, wg, hw, show_layout=False):
     if not R:
         ax.set_visible(False); return False
     il, ol = MEAN[mk]; ns = sorted(R)
-    base, pick, oracle, picklab = [], [], [], []
+    base, base_pp, pick, oracle, picklab = [], [], [], [], []
     for n in ns:
-        r = R[n]; b = r.get(f"TP{world}PP1_uniform")
+        r = R[n]; b = r.get(f"TP{world}PP1_uniform"); bpp = r.get(f"TP1PP{world}_uniform")
         pk = P.plan(P.MODELS[mk], hw, P.Workload(il, ol, n), top_k=1)[0][1]
         cand = [(lab, v) for lab, v in r.items() if v[2] == pk.tp and v[3] == pk.pp]
         if not cand:
@@ -60,20 +60,31 @@ def _draw_panel(ax, mk, hg, wg, hw, show_layout=False):
             mlab, mv = min(cand, key=lambda x: sum(abs(a - c) for a, c in zip(x[1][1], pk.layer_split)))
             base.append(b[0] if b else 0); pick.append(mv[0])
             picklab.append(f"TP{pk.tp}x PP{pk.pp} L={'-'.join(map(str, pk.layer_split))}")
+        base_pp.append(bpp[0] if bpp else 0)
         oracle.append(max(v[0] for v in r.values()))
-    x = np.arange(len(ns)); w = 0.27
-    ax.bar(x - w, base, w, color="#bdc1c6", edgecolor="#80868b")
-    ax.bar(x, pick, w, color="#1a73e8", edgecolor="#174ea6")
-    ax.bar(x + w, oracle, w, color="#fbbc04", edgecolor="#ea8600", hatch="..")
-    top = max(max(base), max(pick), max(oracle), 1)
+    has_pp = any(v > 0 for v in base_pp)          # PP baseline measured at this layout?
+    x = np.arange(len(ns))
+    if has_pp:                                     # 4 bars: TP / PP / pick / oracle
+        w = 0.2; off_pick, off_orc = 0.5 * w, 1.5 * w
+        ax.bar(x - 1.5 * w, base, w, color="#bdc1c6", edgecolor="#80868b")
+        ax.bar(x - 0.5 * w, base_pp, w, color="#5f6368", edgecolor="#3c4043")
+        ax.bar(x + 0.5 * w, pick, w, color="#1a73e8", edgecolor="#174ea6")
+        ax.bar(x + 1.5 * w, oracle, w, color="#fbbc04", edgecolor="#ea8600", hatch="..")
+    else:                                          # 3 bars: TP / pick / oracle (PP not measured)
+        w = 0.27; off_pick, off_orc = 0.0, w
+        ax.bar(x - w, base, w, color="#bdc1c6", edgecolor="#80868b")
+        ax.bar(x, pick, w, color="#1a73e8", edgecolor="#174ea6")
+        ax.bar(x + w, oracle, w, color="#fbbc04", edgecolor="#ea8600", hatch="..")
+    top = max(max(base), max(base_pp), max(pick), max(oracle), 1)
     for j in range(len(ns)):
-        if base[j] > 0:
-            ax.text(j - w, pick[j] + top * 0.02, f"{(pick[j]/base[j]-1)*100:+.0f}%",
-                    ha="center", fontsize=10, fontweight="bold",
-                    color="#137333" if pick[j] >= base[j] else "#c5221f")
+        best_base = max(base[j], base_pp[j])      # vs the better naive homogeneous baseline
+        if best_base > 0:
+            ax.text(j + off_pick, pick[j] + top * 0.02, f"{(pick[j]/best_base-1)*100:+.0f}%",
+                    ha="center", fontsize=9.5, fontweight="bold",
+                    color="#137333" if pick[j] >= best_base else "#c5221f")
         if oracle[j] > pick[j] * 1.03:
-            ax.text(j + w, oracle[j] + top * 0.02, f"−{(1-pick[j]/oracle[j])*100:.0f}%",
-                    ha="center", fontsize=8.5, fontweight="bold", color="#ea8600")
+            ax.text(j + off_orc, oracle[j] + top * 0.02, f"−{(1-pick[j]/oracle[j])*100:.0f}%",
+                    ha="center", fontsize=8, fontweight="bold", color="#ea8600")
     ax.set_xticks(x); ax.set_xticklabels([f"n={n}" for n in ns], fontsize=10)
     ax.set_ylim(0, top * 1.24)
     t = f"{TITLE[mk]}  ({hg}+{wg})" if show_layout else f"{TITLE[mk]} — mixed traffic"
@@ -86,10 +97,11 @@ def _draw_panel(ax, mk, hg, wg, hw, show_layout=False):
 
 
 def _legend(fig, world_label="TP=world"):
-    fig.legend(handles=[Patch(fc="#bdc1c6", ec="#80868b", label=f"baseline — uniform {world_label}"),
+    fig.legend(handles=[Patch(fc="#bdc1c6", ec="#80868b", label="baseline (TP) — uniform TP=world"),
+                        Patch(fc="#5f6368", ec="#3c4043", label="baseline (PP) — uniform TP1xPP=world"),
                         Patch(fc="#1a73e8", ec="#174ea6", label="planner pick"),
                         Patch(fc="#fbbc04", ec="#ea8600", hatch="..", label="best measured (oracle)")],
-               loc="lower center", ncol=3, fontsize=11, bbox_to_anchor=(0.5, 0.0))
+               loc="lower center", ncol=4, fontsize=10, bbox_to_anchor=(0.5, 0.0))
 
 
 def plot_layout(hg, wg):
@@ -103,7 +115,7 @@ def plot_layout(hg, wg):
         _draw_panel(axes[0][i], mk, hg, wg, hw)
     _legend(fig, f"TP{world}")
     fig.suptitle(f"Mixed-traffic serving: varied (input,output) shapes per request in one stream — "
-                 f"planner pick vs uniform baseline ({hg}+{wg})", fontsize=12)
+                 f"planner pick vs uniform-TP & uniform-PP baselines ({hg}+{wg})", fontsize=12)
     plt.tight_layout(rect=[0, 0.06, 1, 1])
     p = OUT / f"fig_mixed_traffic_{hg}x{wg}.png"
     fig.savefig(p, dpi=140, bbox_inches="tight"); plt.close(fig)
@@ -128,7 +140,7 @@ def plot_combined():
         for ci, mk in enumerate(models):
             _draw_panel(axes[ri][ci], mk, hg, wg, hw, show_layout=True)
     _legend(fig, "TP=world (per layout)")
-    fig.suptitle("Mixed-traffic serving — planner pick vs uniform baseline vs measured oracle\n"
+    fig.suptitle("Mixed-traffic serving — planner pick vs uniform-TP & uniform-PP baselines vs measured oracle\n"
                  "(varied (input,output) shapes per request in one concurrent stream)", fontsize=13)
     plt.tight_layout(rect=[0, 0.05, 1, 0.98])
     p = OUT / "fig_mixed_traffic_combined.png"
