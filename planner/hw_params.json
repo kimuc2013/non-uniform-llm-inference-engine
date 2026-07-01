@@ -1,12 +1,13 @@
 {
+  "_PROVENANCE": "2026-07-01: compute REPLACED with MEASURED roofline (compute_microbench.py best-of shape-sweep, bf16-fp32acc). Old 578/366/1400/707 were serving-FIT (the 'notes' log below is now SUPERSEDED). Measured beats fit on regret_eval (8.5%->7.6%) and reproduces 70B TP8 ITL within 13% (fit was 2x too fast). ar_bw/decode_ar_overlap in fitted_params.json are ALSO measured now (1.07 / 0.08). Remaining fit keys (step_floor,c_mb,c_chunk,overlap_eta,prefill_overlap) pending benches #2-6.",
   "blackwell": {
-    "eff_tflops_prefill": 578,
-    "eff_membw_decode_gbs": 1400,
+    "eff_tflops_prefill": 422,
+    "eff_membw_decode_gbs": 1517,
     "mem_gb": 96
   },
   "ada": {
-    "eff_tflops_prefill": 366,
-    "eff_membw_decode_gbs": 707,
+    "eff_tflops_prefill": 121,
+    "eff_membw_decode_gbs": 887,
     "mem_gb": 48
   },
   "prefill_ar_overlap": 0.8,

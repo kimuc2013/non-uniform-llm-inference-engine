@@ -1,0 +1,34 @@
+{
+  "fitted": {
+    "ar_latency_us": 48.0,
+    "ar_bw_gbs": 1.07,
+    "intra_ar_latency_us": 5.0,
+    "step_floor_ms": 1.5,
+    "c_mb_ms": 1.5,
+    "c_chunk_ms": 5.0,
+    "overlap_eta": 0.7,
+    "prefill_overlap": 0.8,
+    "decode_ar_overlap": 0.08
+  },
+  "_provenance": {
+    "MEASURED": {
+      "compute (in hw_params.json)": "Blackwell 422 TFLOPS/1517 GB/s, Ada 121/887 (compute_microbench best-of shape-sweep, bf16-fp32acc)",
+      "ar_bw_gbs=1.07": "isolated cross-node AR @1MB (ar_microbench + graph_chain + 851us profile agree). Fit's 4.0 was WRONG (predicted 70B TP8 ITL 2x too fast).",
+      "ar_latency_us=48": "LSQ intercept of iso_ar_surface small-message (world=2). Fit's 5.0 was unphysical; 48 improves 1+1 regret 24.5->13.4%.",
+      "decode_ar_overlap=0.08": "graph_chain exposed(853us) vs isolated(924us)."
+    },
+    "DERIVED (engine structure, documented; NOT fit; negligible regret impact)": {
+      "step_floor_ms=1.5": "per-decode-step host/dispatch floor: CUDA-graph replay launch + sampling + Python dispatch. Regret-invariant (verified).",
+      "c_mb_ms=1.5": "per-microbatch CPU dispatch (fork persistent-batch input churn). Regret-invariant.",
+      "c_chunk_ms=5.0": "per-prefill-chunk scheduler+prepare_inputs CPU span. Regret-invariant.",
+      "intra_ar_latency_us=5.0": "PCIe-class intra-node hop (cluster has no NVLink; nvidia-smi topo=PCIe both nodes)."
+    },
+    "DERIVED (resource model)": {
+      "prefill_overlap=0.8": "prefill(tensor-core) and decode(HBM) are disjoint resources -> mostly overlap under v1 chunked continuous batching. ~0.8 (attention non-linear part doesn't overlap). Slight regret improvement 6.9->6.8%."
+    },
+    "MEASURED (fork PP-overlap profiling)": {
+      "overlap_eta=0.7": "fork PP stage-overlap efficiency, from torch-profiler traces of the fork's 1F1B+side-stream PP path (verify_pp_overlap_torch_profiler.py; measured 56-78% across configs, ~0.7 representative). Replaces the FIT's unphysical 1.0 (perfect overlap), which under-predicted 70B TP4PP2 ITL by ~15ms. KNOWN RESIDUAL: at the 1+1 layout only (TP1PP2, tp=1, small/artifact-prone, 9 cells) the single-scalar 0.7 mis-ranks vs the oracle (regret 24->36%); 4+4 (headline) and 2+2 are unaffected/better. A per-pp overlap_eta would fix 1+1 — noted as a refinement, NOT re-fit to 1.0."
+    }
+  },
+  "note": "fit_planner.py RETIRED: all 9 params are now MEASURED (compute/ar_bw/ar_latency/decode_ar_overlap/overlap_eta) or DERIVED+documented (step_floor/c_mb/c_chunk/intra_ar/prefill_overlap) — none is fit to serving throughput. regret 4+4=6.1% / overall ~7% (was 8.5% under the 9-param serving fit; measured is more physical AND competitive). This file should be renamed measured_params.json; fit_planner.py deleted."
+}

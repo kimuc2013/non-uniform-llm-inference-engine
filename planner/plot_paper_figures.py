@@ -155,7 +155,7 @@ def fig_validation():
     colors = {"4+4": "#1f77b4", "2+2": "#ff7f0e", "1+1": "#2ca02c"}
     for tag in ("4+4", "2+2", "1+1"):
         xs = [m for m, p, t in pts if t == tag]; ys = [p for m, p, t in pts if t == tag]
-        ax1.scatter(xs, ys, s=22, alpha=0.7, color=colors[tag], label=f"{tag} (zero-refit)" if tag != "4+4" else "4+4 (fit)")
+        ax1.scatter(xs, ys, s=22, alpha=0.7, color=colors[tag], label=f"{tag} (zero-refit)" if tag != "4+4" else "4+4 (calibrated)")
     lim = max(max(m for m, p, t in pts), max(p for m, p, t in pts)) * 1.05
     ax1.plot([0, lim], [0, lim], "k--", alpha=0.4)
     ax1.set_xlabel("measured TPS"); ax1.set_ylabel("predicted TPS")

@@ -55,7 +55,14 @@ def short(label):
 
 
 def load():
-    rdir = sorted(glob.glob(str(REPO / "results" / "hetero_4x4_mistral123b_full_*")))[-1]
+    # dirs are named hetero_4x4_mistral123b_<timestamp> (the old _full_ tag is gone);
+    # pick the richest sweep (most all_runs.csv rows), not just the latest (which may be
+    # a 1-cell re-run).
+    _cands = glob.glob(str(REPO / "results" / "hetero_4x4_mistral123b_*"))
+    if not _cands:
+        raise SystemExit("no hetero_4x4_mistral123b_* results dir")
+    rdir = max(_cands, key=lambda d: (Path(d) / "all_runs.csv").exists()
+               and sum(1 for _ in open(Path(d) / "all_runs.csv")) or 0)
     meas = {}
     for r in csv.DictReader(open(Path(rdir) / "all_runs.csv")):
         if r["success"] == "True" and float(r["tps"]) > 0:
@@ -122,10 +129,11 @@ def fig_prereg(meas, pred_j, val):
         ax.bar(x + w/2, p, w, color=cols, alpha=0.45, hatch="///",
                edgecolor="black", linewidth=0.4, label="predicted (pre-reg)")
         pc = val["per_workload"][wl]["predicted_champion"]
-        ci = labs.index(pc)
-        ax.annotate("★ pred champ\n= meas #1", (ci, max(m[ci], p[ci])),
-                    textcoords="offset points", xytext=(0, 8), ha="center",
-                    fontsize=8.5, fontweight="bold", color="#7a5c00")
+        if pc in labs:                                    # champion may be absent if the
+            ci = labs.index(pc)                           # measured sweep dir differs from
+            ax.annotate("★ pred champ\n= meas #1", (ci, max(m[ci], p[ci])),  # the frozen prereg
+                        textcoords="offset points", xytext=(0, 8), ha="center",
+                        fontsize=8.5, fontweight="bold", color="#7a5c00")
         pw = val["per_workload"][wl]
         ax.set_title(f"{wl}\nmatch ✓  regret {pw['regret_pct']:.1f}%  ρ={pw['spearman']:.2f}",
                      fontsize=10, fontweight="bold")

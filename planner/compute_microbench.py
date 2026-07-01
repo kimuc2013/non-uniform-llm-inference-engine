@@ -37,17 +37,31 @@ def membw_gbs(dev, gb=20.0, iters=50, reps=3):
     return best
 
 
-def prefill_tflops(dev, iters=50, reps=3):
-    shapes = [(8192, 8192, 8192), (8192, 14336, 4096)]   # square + FFN-like
-    best = 0.0
+def prefill_tflops(dev, iters=50, reps=8):
+    """Roofline bf16-input/fp32-accumulate GEMM TFLOPS (cuBLAS default acc). Sweep a
+    range of large compute-bound shapes (square + FFN-like + attention-proj-like) and
+    take the BEST achieved — the roofline. Many reps + long warmup so boost clocks are
+    reached (we cannot lock clocks without sudo). c reused (out=) to avoid alloc noise."""
+    shapes = [
+        (8192, 8192, 8192), (16384, 8192, 8192), (16384, 16384, 8192),   # large square
+        (8192, 14336, 4096), (8192, 4096, 14336),                        # FFN up/down
+        (8192, 8192, 28672), (16384, 8192, 1024),                        # wide / skinny
+    ]
+    best = 0.0; best_shape = None
     for (M, K, N) in shapes:
-        a = torch.randn(M, K, dtype=torch.bfloat16, device=dev)
-        b = torch.randn(K, N, dtype=torch.bfloat16, device=dev)
-        c = torch.empty(M, N, dtype=torch.bfloat16, device=dev)
+        try:
+            a = torch.randn(M, K, dtype=torch.bfloat16, device=dev)
+            b = torch.randn(K, N, dtype=torch.bfloat16, device=dev)
+            c = torch.empty(M, N, dtype=torch.bfloat16, device=dev)
+        except RuntimeError:
+            continue                                     # skip if OOM on the smaller GPU
         for _ in range(reps):
-            t = _time(lambda: torch.matmul(a, b, out=c), iters)
-            best = max(best, (2 * M * N * K) / t / 1e12)
-    return best
+            t = _time(lambda: torch.matmul(a, b, out=c), iters, warm=15)
+            tf = (2 * M * N * K) / t / 1e12
+            if tf > best:
+                best, best_shape = tf, (M, K, N)
+        del a, b, c; torch.cuda.empty_cache()
+    return best, best_shape
 
 
 def main():
@@ -55,13 +69,14 @@ def main():
     name = torch.cuda.get_device_name(0)
     gtype = "blackwell" if ("PRO 6000" in name or "B" in name and "6000" in name) else "ada"
     bw = membw_gbs(dev)
-    tf = prefill_tflops(dev)
+    tf, shp = prefill_tflops(dev)
     r = REF.get(gtype, {})
     print(f"GPU={name}  type={gtype}")
     print(f"  membw_decode_gbs  raw_measured={bw:7.0f}  planner_effective={r.get('membw','?'):>5}  "
           f"ratio(eff/raw)={r.get('membw',0)/bw:.2f}")
     print(f"  prefill_tflops    raw_measured={tf:7.0f}  planner_effective={r.get('tflops','?'):>5}  "
-          f"ratio(eff/raw)={r.get('tflops',0)/tf:.2f}")
+          f"ratio(eff/raw)={r.get('tflops',0)/tf:.2f}  best_shape={shp}")
+    print(f"MEASURED {gtype} membw_gbs={bw:.0f} tflops={tf:.0f}")
 
 
 if __name__ == "__main__":

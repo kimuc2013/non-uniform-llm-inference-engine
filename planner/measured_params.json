@@ -1,0 +1,176 @@
+{
+  "_fingerprint": {
+    "head_gpus": [
+      "NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB",
+      "NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB",
+      "NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB",
+      "NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB"
+    ],
+    "worker_gpus": [
+      "NVIDIA RTX 6000 Ada Generation, 49140 MiB",
+      "NVIDIA RTX 6000 Ada Generation, 49140 MiB",
+      "NVIDIA RTX 6000 Ada Generation, 49140 MiB",
+      "NVIDIA RTX 6000 Ada Generation, 49140 MiB"
+    ],
+    "n_head": 4,
+    "n_worker": 4,
+    "driver": [
+      "580.159.03"
+    ],
+    "sw": "torch2.11.0+cu130_cuda13.0_nccl2.28.9",
+    "bench_version": "2026-07-01.1",
+    "topo_hash": "31dd03075789",
+    "key": "e7ea51876d1aa57b"
+  },
+  "_mode": "default",
+  "_calibrated_at": "2026-07-01 13:17:56",
+  "_calibration_seconds": 308.2,
+  "blackwell": {
+    "eff_membw_decode_gbs": 1517.0,
+    "eff_tflops_prefill": 414.0,
+    "mem_gb": 96
+  },
+  "ada": {
+    "eff_membw_decode_gbs": 887.0,
+    "eff_tflops_prefill": 123.0,
+    "mem_gb": 48
+  },
+  "interconnect": {
+    "ar_bw_gbs": 1.17,
+    "decode_ar_overlap": 0.063,
+    "ar_latency_us": 35.3,
+    "p2p_latency_us": 200.0,
+    "p2p_bw_gbs": 10.0
+  },
+  "prefill_overlap": 0.98,
+  "_log": [
+    "  compute: {'blackwell': {'eff_membw_decode_gbs': 1517.0, 'eff_tflops_prefill': 414.0}, 'ada': {'eff_membw_decode_gbs': 887.0, 'eff_tflops_prefill': 123.0}}",
+    "  AR: bw=1.17 GB/s  decode_ar_overlap=0.063",
+    "  prefill_overlap=0.98"
+  ],
+  "_provenance": {
+    "MEASURED": "blackwell/ada eff_tflops_prefill + eff_membw_decode_gbs (compute_microbench); mem_gb (nvidia-smi 97887/49140 MiB); interconnect ar_bw_gbs+decode_ar_overlap (graph_chain_ar_microbench); iso_ar_surface + ar_latency_us (ar_microbench cross-node, monotonized for the cost model); prefill_overlap (gemm probe); intra AR bw+latency (intra_calib, PCIe / no NVLink); ",
+    "PRIOR_documented": "interconnect p2p (small PP-send, IB-class); step_floor_ms/c_mb_ms/c_chunk_ms (host-launch/dispatch floors \u2014 documented priors, regret-invariant, kernel-launch probe TODO); prefill_ar_overlap=0.8 (Megatron async-TP / sequence-parallel: cross-node TP AllReduce largely hidden under prefill GEMMs \u2014 LITERATURE prior, NOT measured NOT fit; graph_chain@prefill-batch measurement is a TODO).",
+    "MODEL_dependence": "overlap_eta is MODEL-dependent, measured on overlap_eta_model. All OTHER params are HARDWARE-only (fingerprint-cached). perf_planner._warn_eta_model warns when a different model is planned with the transferred eta.",
+    "NOT_fit": "No value fit to serving throughput; fit_planner.py retired. The former prefill_ar_overlap free-parameter fit (hw_params.json =0.8) is SUPERSEDED by the async-TP literature prior of like magnitude, now sourced from THIS file and labelled a prior.",
+    "_assembly_note": "Assembled across a mode=default profiler run (compute/AR/surface/intra/prefill_overlap/dispatch) PLUS a separate manual decode-clean overlap_eta measurement. `hardware_profiler.py --mode thorough --model 70b` reproduces all of it in one run.",
+    "overlap_eta_CAVEAT": "overlap_eta=0.65 is an EFFECTIVE cost-model pipeline-efficiency param, NOT a direct overlap measurement: it is the eta that makes t_cycle reproduce the MEASURED 70B TP4PP2 decode itl (62.83ms, decode-clean run results/verify_pp_overlap_20260701_181807, roofline step_floor-consistent inversion). The fork's ACTUAL cross-stage PP overlap is 56-78% (direct torch-profiler trace analysis, separate). The roofline inversion is CONFOUNDED for comm-bound small models (8B TP4PP2 GPU time is ~90% NCCL AllReduce/PP SendRecv, not compute) \u2014 it returns 0 there, which is a measurement artifact, NOT 'no overlap'. Do NOT extrapolate this 70B scalar to small models; perf_planner._warn_eta_model flags cross-model use. Direct-trace overlap is the correct measure for small models."
+  },
+  "iso_ar_surface": {
+    "1": [
+      [
+        0.016,
+        0.2
+      ],
+      [
+        0.033,
+        0.4
+      ],
+      [
+        0.066,
+        0.7
+      ],
+      [
+        0.131,
+        1.1
+      ],
+      [
+        0.262,
+        1.4
+      ],
+      [
+        0.524,
+        1.6
+      ],
+      [
+        1.049,
+        6.8
+      ],
+      [
+        2.097,
+        9.7
+      ]
+    ],
+    "2": [
+      [
+        0.016,
+        0.1
+      ],
+      [
+        0.033,
+        0.3
+      ],
+      [
+        0.066,
+        0.5
+      ],
+      [
+        0.131,
+        0.8
+      ],
+      [
+        0.262,
+        1.1
+      ],
+      [
+        0.524,
+        1.2
+      ],
+      [
+        1.049,
+        5.3
+      ],
+      [
+        2.097,
+        6.9
+      ]
+    ],
+    "4": [
+      [
+        0.016,
+        0.2
+      ],
+      [
+        0.033,
+        0.2
+      ],
+      [
+        0.066,
+        0.4
+      ],
+      [
+        0.131,
+        0.6
+      ],
+      [
+        0.262,
+        0.8
+      ],
+      [
+        0.524,
+        1.0
+      ],
+      [
+        1.049,
+        1.0
+      ],
+      [
+        2.097,
+        5.5
+      ]
+    ]
+  },
+  "intra": {
+    "intra_ar_bw_gbs": 16.0,
+    "intra_ar_latency_us": 2.7,
+    "nvlink_ar_bw_gbs": 18.0,
+    "nvlink_ar_latency_us": 2.7
+  },
+  "overlap_eta": 0.65,
+  "kv_bw_scale": 1.0,
+  "step_floor_ms": 1.5,
+  "c_mb_ms": 1.5,
+  "c_chunk_ms": 5.0,
+  "overlap_eta_model": "70b",
+  "prefill_ar_overlap": 0.8
+}

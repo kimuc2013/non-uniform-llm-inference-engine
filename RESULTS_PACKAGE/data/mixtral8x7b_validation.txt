@@ -1,0 +1,14 @@
+
+===== Mixtral-8x7B  4+4  (balanced) =====
+  n= 16  planner_pick=TP8xPP1   meas_best=TP8xPP1   [OK]  prereg=TP8xPP1
+      TP8xPP1   TP8PP1_uniform       meas=    629 pred=    656 err=   +4%
+      TP4xPP2   TP4PP2_uniform       meas=    450 pred=    443 err=   -1%
+  n= 32  planner_pick=TP8xPP1   meas_best=TP8xPP1   [OK]  prereg=TP8xPP1
+      TP8xPP1   TP8PP1_uniform       meas=   1071 pred=   1123 err=   +5%
+      TP4xPP2   TP4PP2_uniform       meas=   1033 pred=    806 err=  -22%
+  n= 64  planner_pick=TP4xPP2   meas_best=TP4xPP2   [OK]  prereg=TP4xPP2
+      TP4xPP2   TP4PP2_uniform       meas=   1934 pred=   1542 err=  -20%
+      TP8xPP1   TP8PP1_uniform       meas=   1591 pred=   1758 err=  +11%
+  n= 96  planner_pick=TP4xPP2   meas_best=TP4xPP2   [OK]  prereg=TP4xPP2
+      TP4xPP2   TP4PP2_uniform       meas=   2704 pred=   2232 err=  -17%
+      TP8xPP1   TP8PP1_uniform       meas=   1591 pred=   2203 err=  +38%

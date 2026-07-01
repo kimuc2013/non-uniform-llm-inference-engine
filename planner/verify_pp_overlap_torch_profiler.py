@@ -26,18 +26,34 @@ _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 from planner.cluster_env import CFG
+from planner.perf_planner import MODELS
 
 REPO = _REPO
 PY = CFG.head_py
 PERF = REPO / "perf" / "performance.py"
-MODEL = "meta-llama/Llama-3.3-70B-Instruct"
+
+# eta is MODEL-DEPENDENT (bigger model -> more compute to hide the fixed PP bubble ->
+# higher eta), so measure it ON THE DEPLOYMENT MODEL (the one being served, loaded here
+# anyway). PP_OVERLAP_MODEL selects it; the hardware params stay cluster-cached.
+MODEL_KEY = os.environ.get("PP_OVERLAP_MODEL", "70b")
+_SPEC = MODELS[MODEL_KEY]
+MODEL = _SPEC.name
+N_LAYERS = _SPEC.n_layers
+HIDDEN = _SPEC.hidden
+FFN_DIM = _SPEC.ffn_dim
+N_Q = _SPEC.n_q
+N_KV = _SPEC.n_kv
 
 TP = 4
-PP = 2
-LAYER_SPLIT = [44, 36]
-N_REQ = 16   # small workload for clean trace
-IN_LEN = 256
-OUT_LEN = 32   # capture ~32 decode iterations
+PP = 2                       # cross-node PP=2 on the 4+4 cluster — the PP config the planner evaluates
+LAYER_SPLIT = [N_LAYERS // 2, N_LAYERS - N_LAYERS // 2]   # uniform (eta ~ split-insensitive)
+N_REQ = int(os.environ.get("PP_OVERLAP_NREQ", "64"))   # env-tunable batch. mb_size=N_REQ/PP.
+             # Small N_REQ -> tiny decode kernels -> GPU starves on Python dispatch (CPU-bound,
+             # eta artefact ~0); larger N_REQ -> bigger GEMMs -> GPU-bound -> real overlap.
+IN_LEN = 8     # DECODE-CLEAN: tiny prefill (64*8=512 tok, 1 chunk, done instantly) so the
+               # trace is dominated by PURE decode steps -- no chunked-prefill contamination
+               # of the per-stage busy times (IN=256 inflated head-busy ~2x, gave bogus eta~0)
+OUT_LEN = 48   # ~48 decode steps -> ~35 steady-state after dropping warmup
 
 
 def _build_env(trace_dir):
@@ -48,6 +64,7 @@ def _build_env(trace_dir):
     env["CUDA_HOME"] = "/usr/local/cuda-12.9"
     env["VLLM_HOST_IP"] = CFG.head_fabric_ip
     env["RAY_ADDRESS"] = CFG.ray_address
+    env["HF_HUB_OFFLINE"] = "1"   # gated 70B: avoid the HF-429 "Parse safetensors" 3h stall
     env["VLLM_LOGGING_LEVEL"] = "WARNING"
     env["NCCL_DEBUG"] = "WARN"
     env["NCCL_SOCKET_IFNAME"] = f"{CFG.head_fabric_iface},{CFG.worker_fabric_iface}"
@@ -56,9 +73,9 @@ def _build_env(trace_dir):
     env["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
     env["VLLM_USE_FLASHINFER_MOE"] = "0"
     env["VLLM_PP_LAYER_PARTITION"] = ",".join(str(x) for x in LAYER_SPLIT)
-    env["VLLM_TP_FFN_SPLITS"]  = ",".join(str(x) for x in [7168] * 4)
-    env["VLLM_TP_HEAD_SPLITS"] = ",".join(str(x) for x in [16] * 4)
-    env["VLLM_TP_KV_SPLITS"]   = ",".join(str(x) for x in [2] * 4)
+    env["VLLM_TP_FFN_SPLITS"]  = ",".join(str(FFN_DIM // TP) for _ in range(TP))
+    env["VLLM_TP_HEAD_SPLITS"] = ",".join(str(N_Q // TP) for _ in range(TP))
+    env["VLLM_TP_KV_SPLITS"]   = ",".join(str(max(1, N_KV // TP)) for _ in range(TP))
     env["VLLM_PP_SAMPLED_BROADCAST_STREAM"] = "1"
     env["VLLM_PP_MICROBATCH"] = "1"
     env["VLLM_PP_MICROBATCH_SIZE"] = str(N_REQ // PP)
@@ -77,9 +94,11 @@ def _free_port(start=29800):
             except: pass
 
 
-def post(url, data=b""):
+def post(url, data=b"", timeout=600):
+    # stop_profile BLOCKS until all ranks flush their (large) traces -- 120s was too
+    # short and crashed the script mid-flush (=> manual scp + a truncated rank). 600s.
     req = urllib.request.Request(url, data=data, method="POST")
-    with urllib.request.urlopen(req, timeout=120) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.status, r.read().decode()
 
 
@@ -94,6 +113,11 @@ def main():
                     f"mkdir -p {trace_dir}"], timeout=15)
     print(f"OUT: {out_root}", flush=True)
     print(f"trace_dir: {trace_dir} (per-node)", flush=True)
+    (out_root / "run_meta.json").write_text(json.dumps({
+        "model_key": MODEL_KEY, "model": MODEL, "n_layers": N_LAYERS, "hidden": HIDDEN,
+        "tp": TP, "pp": PP, "layer_split": LAYER_SPLIT,
+        "n_req": N_REQ, "in_len": IN_LEN, "out_len": OUT_LEN}))
+    print(f"model={MODEL_KEY} ({MODEL}) TP{TP}PP{PP} split={LAYER_SPLIT}", flush=True)
 
     port = _free_port()
     env = _build_env(trace_dir)
@@ -174,6 +198,7 @@ def main():
     ]
     perf_env = os.environ.copy()
     perf_env["PATH"] = f"{Path(PY).parent}:" + perf_env.get("PATH", "")
+    perf_env["HF_HUB_OFFLINE"] = "1"   # client tokenizer load: use cached gated 70B, no HF auth
     with (out_root / "perf.log").open("w") as f:
         subprocess.run(perf_cmd, env=perf_env, cwd=str(REPO),
                        stdout=f, stderr=subprocess.STDOUT, timeout=300)

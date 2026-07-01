@@ -1,12 +1,12 @@
 {
   "blackwell": {
     "eff_membw_decode_gbs": 1517.0,
-    "eff_tflops_prefill": 417.0,
+    "eff_tflops_prefill": 422.0,
     "mem_gb": 96
   },
   "ada": {
     "eff_membw_decode_gbs": 887.0,
-    "eff_tflops_prefill": 116.0,
+    "eff_tflops_prefill": 121.0,
     "mem_gb": 48
   },
   "interconnect": {
@@ -98,7 +98,8 @@
       "ar_latency_us(intercept)",
       "kv_bw_scale"
     ],
-    "effective_factor": "ar_bw_gbs = isolated_anchor(1.1) x AR_EFFECTIVE_FACTOR(3.74) = the one engine-structural constant (in-decode AR pipelining) not reproducible by an isolated bench",
+    "ar_bw_gbs_STALE": "4.11 = isolated_anchor(1.1) x 3.74 (REMOVED hand-typed factor). PENDING real pre-serving measurement (bench #1: ar_spaced/AR_PIPELINE). Do NOT use this value as measured.",
+    "tflops_note": "bf16-input/fp32-accumulate roofline, best-of shape-sweep, 2026-07-01 (unpinned clocks, best-of-8-reps). Blackwell/Ada tflops ratio 3.49x (serving-fit hw_params.json claimed 578/366 = 1.58x, wrong).",
     "priors": [
       "p2p (small effect on PP send)",
       "intra_ar (NVLink/PCIe)"

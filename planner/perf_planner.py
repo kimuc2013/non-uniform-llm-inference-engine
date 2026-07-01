@@ -23,6 +23,7 @@ import csv
 import json
 import math
 import os
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -128,7 +129,9 @@ class HardwareSpec:
     # layer allocation. Physics-anchored constants (NOT fitted).
     nvlink_ar_latency_us: float = 4.0
     nvlink_ar_bw_gbs: float = 800.0
-    overlap_eta: float = 0.65       # fork PP overlap efficiency
+    overlap_eta: float = 0.65       # fork PP overlap efficiency (MEASURED 2026-07-01, decode-clean, step_floor-consistent)
+    overlap_eta_model: str = ""     # model key overlap_eta was measured ON (eta is MODEL-dependent;
+                                    # plan() warns if you plan a different model — see _warn_eta_model)
     step_floor_ms: float = 30.0     # per-decode-step CPU/dispatch floor (all topologies)
     c_mb_ms: float = 1.5            # per-microbatch CPU dispatch
     c_chunk_ms: float = 10.0        # per-prefill-chunk overhead
@@ -185,6 +188,23 @@ class HardwareSpec:
         return self.intra_ar_latency_us, self.intra_ar_bw_gbs
 
 
+_LITE_FP = None
+
+
+def _lite_fingerprint():
+    """Cheap LOCAL hardware check (head GPUs only, no ssh) to catch a
+    measured_params.json calibrated on DIFFERENT hardware. Cached per process."""
+    global _LITE_FP
+    if _LITE_FP is None:
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                                 capture_output=True, text=True, timeout=15).stdout.strip().splitlines()
+            _LITE_FP = {"head_gpu": out[0].strip() if out else "", "n_local": len(out)}
+        except Exception:
+            _LITE_FP = {"head_gpu": "", "n_local": 0}
+    return _LITE_FP
+
+
 def load_hardware(path: Path = HW_PARAMS) -> HardwareSpec:
     d = json.loads(path.read_text())
     bw = GpuType("blackwell", d["blackwell"]["eff_tflops_prefill"],
@@ -202,40 +222,71 @@ def load_hardware(path: Path = HW_PARAMS) -> HardwareSpec:
         p2p_bw_gbs=ic["p2p_bw_gbs"],
         prefill_ar_overlap=d.get("prefill_ar_overlap", 0.0),
     )
-    # Overlay MEASURED hardware constants from a pre-serving calibration run
-    # (planner/calibrate.py), if the env points to one. These supersede both the
-    # hw_params base and the fit for the HARDWARE constants they cover; the fit
-    # below is then prevented from clobbering them (measured_keys). Default (env
-    # unset) → byte-identical to the previous fitted-only behaviour.
+    # Load ALL cost-model parameters from the HardwareProfiler output
+    # (planner/measured_params.json) — MEASURED on this cluster this deployment,
+    # fingerprint-cached. This is the ONLY source of the params; there is no serving
+    # fit. If it is absent, warn loudly (degraded) rather than silently fabricate.
     measured_keys = set()
     mp_env = os.environ.get("PLANNER_MEASURED_PARAMS", "")
-    mp = Path(mp_env) if mp_env else None
-    if mp and mp.exists():
+    mp = Path(mp_env) if mp_env else (HERE / "measured_params.json")
+    if mp.exists():
         m = json.loads(mp.read_text())
+        # (a) FINGERPRINT CHECK — refuse a calibration measured on DIFFERENT hardware
+        # (a stale/misplaced file is the top silent-wrong risk). Lightweight, local.
+        fpm = m.get("_fingerprint", {})
+        cur = _lite_fingerprint()
+        stored_head = (fpm.get("head_gpus") or [""])[0].split(",")[0].strip()
+        if cur["head_gpu"] and stored_head and cur["head_gpu"] != stored_head:
+            print(f"[planner] WARNING: {mp.name} was calibrated on '{stored_head}' but THIS machine "
+                  f"is '{cur['head_gpu']}'. Re-run hardware_profiler.py — using STALE params.", file=sys.stderr)
+        # (b) required keys must be present (a truncated/interrupted profiler run must fail
+        # LOUDLY, not KeyError or silently fabricate).
+        req_gpu = ("eff_tflops_prefill", "eff_membw_decode_gbs")
+        req_ic = ("ar_latency_us", "ar_bw_gbs")
+        miss = [k for g in ("blackwell", "ada") for k in req_gpu if k not in m.get(g, {})] \
+             + [k for k in req_ic if k not in m.get("interconnect", {})]
+        if miss:
+            raise ValueError(f"{mp} is incomplete (missing {miss}) — re-run hardware_profiler.py "
+                             f"(do NOT serve on a partial calibration).")
+        # (c) drive NODE COUNTS from the fingerprint (not a hardcoded 4+4)
+        nh = int(fpm.get("n_head", kw["nodes"][0][1]))
+        nw = int(fpm.get("n_worker", kw["nodes"][1][1]))
         bw_m = GpuType("blackwell", m["blackwell"]["eff_tflops_prefill"],
-                       m["blackwell"]["eff_membw_decode_gbs"], m["blackwell"]["mem_gb"])
+                       m["blackwell"]["eff_membw_decode_gbs"], m["blackwell"].get("mem_gb", 96))
         ada_m = GpuType("ada", m["ada"]["eff_tflops_prefill"],
-                        m["ada"]["eff_membw_decode_gbs"], m["ada"]["mem_gb"])
-        kw["nodes"] = ((bw_m, kw["nodes"][0][1]), (ada_m, kw["nodes"][1][1]))
-        ic2, intra2 = m["interconnect"], m["intra"]
+                        m["ada"]["eff_membw_decode_gbs"], m["ada"].get("mem_gb", 48))
+        kw["nodes"] = ((bw_m, nh), (ada_m, nw))
+        ic2, intra2 = m["interconnect"], m.get("intra", {})
+        if "prefill_ar_overlap" in m:
+            kw["prefill_ar_overlap"] = m["prefill_ar_overlap"]
         kw.update(ar_latency_us=ic2["ar_latency_us"], ar_bw_gbs=ic2["ar_bw_gbs"],
-                  p2p_latency_us=ic2["p2p_latency_us"], p2p_bw_gbs=ic2["p2p_bw_gbs"],
-                  intra_ar_bw_gbs=intra2["intra_ar_bw_gbs"],
-                  intra_ar_latency_us=intra2["intra_ar_latency_us"],
-                  nvlink_ar_bw_gbs=intra2["nvlink_ar_bw_gbs"],
-                  nvlink_ar_latency_us=intra2["nvlink_ar_latency_us"],
-                  kv_bw_scale=m.get("kv_bw_scale", 1.0))
-        # ar_bw_gbs is NOT a measured key: the calibrate file carries only the isolated
-        # AR anchor, while the EFFECTIVE in-serving AR bandwidth is fit from serving
-        # (fit_planner.py) — so the fit, not the isolated bench, owns ar_bw_gbs.
-        measured_keys = {"ar_latency_us", "intra_ar_latency_us", "kv_bw_scale"}
+                  decode_ar_overlap=ic2.get("decode_ar_overlap", 0.0),
+                  p2p_latency_us=ic2.get("p2p_latency_us", 200.0), p2p_bw_gbs=ic2.get("p2p_bw_gbs", 10.0),
+                  intra_ar_bw_gbs=intra2.get("intra_ar_bw_gbs", 60.0),
+                  intra_ar_latency_us=intra2.get("intra_ar_latency_us", 5.0),
+                  nvlink_ar_bw_gbs=intra2.get("nvlink_ar_bw_gbs", 800.0),
+                  nvlink_ar_latency_us=intra2.get("nvlink_ar_latency_us", 4.0),
+                  kv_bw_scale=m.get("kv_bw_scale", 1.0), overlap_eta=m.get("overlap_eta", 0.65),
+                  overlap_eta_model=m.get("overlap_eta_model", ""),
+                  prefill_overlap=m.get("prefill_overlap", 0.98),
+                  step_floor_ms=m.get("step_floor_ms", 1.5), c_mb_ms=m.get("c_mb_ms", 1.5),
+                  c_chunk_ms=m.get("c_chunk_ms", 5.0))
+        # EVERY param is measured/derived here -> nothing is overridden by any fit.
+        measured_keys = {"ar_latency_us", "ar_bw_gbs", "decode_ar_overlap", "intra_ar_latency_us",
+                         "kv_bw_scale", "overlap_eta", "prefill_overlap", "step_floor_ms",
+                         "c_mb_ms", "c_chunk_ms"}
         if "iso_ar_surface" in m:
             global _ISO_AR_SURFACE, _ISO_AR_REF
-            _ISO_AR_SURFACE = {int(k): [tuple(p) for p in v] for k, v in m["iso_ar_surface"].items()}
+            _ISO_AR_SURFACE = _monotonize_surface(
+                {int(k): [tuple(p) for p in v] for k, v in m["iso_ar_surface"].items()})
             _ISO_AR_REF = _iso_ar_bw(min(4, max(_ISO_AR_SURFACE)), 1.049)
-    # Overlay calibration-fitted engine params if present so the planner
-    # actually predicts with the fit (fit_planner.py output). Measured keys are
-    # NOT re-overlaid by the fit.
+    else:
+        import sys as _sys
+        print("[planner] WARNING: no calibration (planner/measured_params.json). Run "
+              "`python planner/hardware_profiler.py` before serving. Using hw_params.json "
+              "base (DEGRADED — not the measured values for this machine).", file=_sys.stderr)
+    # Legacy fit overlay (fit_planner.py) — RETIRED. Only fills keys the calibration
+    # did not provide (none, when measured_keys is populated). Kept for degraded mode.
     fp = HERE / "fitted_params.json"
     if fp.exists():
         fit = json.loads(fp.read_text()).get("fitted", {})
@@ -323,12 +374,39 @@ def params_on_rank(m: ModelSpec, layers: int, head_r: int, ffn_r: int,
 #       bandwidth collapses as n_local grows (6.0 / 4.7 / 1.1 GB/s for 1/2/4).
 # This is why an 8 B model (0.5 MB AR) sees no small-layout speed-up while a 70 B
 # model (1.05 MB) does — message size, not just topology, gates the cost.
-_ISO_AR_SURFACE = {                                       # n_local -> [(msg_MB, GB/s)]
-    1: [(0.066, 0.6), (0.131, 1.0), (0.262, 1.2), (0.524, 1.5), (1.049, 6.0), (2.097, 9.1)],
-    2: [(0.066, 0.4), (0.131, 0.8), (0.262, 1.0), (0.524, 1.1), (1.049, 4.7), (2.097, 6.7)],
-    4: [(0.524, 1.0), (1.049, 1.1), (1.573, 1.1)],
-}
-_ISO_AR_REF = 1.07          # _iso_ar_bw(n_local=4, ~1.05 MB): the ar_bw_gbs anchor
+def _monotonize_surface(surf):
+    """Cost-model monotonicity GUARD on the measured AR surface. NCCL's LL->Simple
+    algorithm switch shows up as a ~5x BANDWIDTH JUMP near ~2 MB; fed raw into
+    t_allreduce = vol/bw that makes AR TIME *decrease* as the message grows, so decode
+    t_cycle would drop with batch (more load = faster) — non-physical, and it breaks the
+    cycle_mono/ar_sane self-consistency invariants and mis-guides plan(). Cap each point's
+    bw so bw grows at most LINEARLY with msg vs the previous point => AR time is
+    non-decreasing in message. The raw measured values stay in measured_params.json /
+    _ISO_AR_SURFACE comments; this only shapes how they feed the cost model (a documented
+    guard, NOT a refit)."""
+    out = {}
+    for nl, row in surf.items():
+        r = sorted((float(a), float(b)) for a, b in row)
+        capped = [list(r[0])]
+        for msg, bw in r[1:]:
+            pmsg, pbw = capped[-1]
+            capped.append([msg, min(bw, pbw * msg / pmsg)])   # t = msg/bw non-decreasing
+        out[nl] = [tuple(p) for p in capped]
+    return out
+
+
+_ISO_AR_SURFACE = _monotonize_surface({                   # n_local -> [(msg_MB, GB/s)]
+    # MEASURED 2026-07-01 (ar_microbench, AR_CUDA_GRAPH=1, cross-node 2-node, full B-sweep
+    # b=1..128 @ hidden=8192). Reproduces the prior sparse surface at overlapping points and
+    # fills n_local=4 across the whole msg range. Anchor n_local=4 @1.049MB = 1.0 GB/s
+    # (≈ graph_chain ar_bw_gbs 1.17 and the 70B-TP8 851us decode-profile AR). See
+    # /scfs/esca/surface_calib.log. _monotonize_surface caps the ~2MB NCCL-algo bw cliff.
+    # Only the profiler default; load_hardware() overrides from measured_params.json.
+    1: [(0.016, 0.2), (0.033, 0.4), (0.066, 0.7), (0.131, 1.1), (0.262, 1.4), (0.524, 1.6), (1.049, 6.8), (2.097, 9.7)],
+    2: [(0.016, 0.1), (0.033, 0.3), (0.066, 0.5), (0.131, 0.8), (0.262, 1.1), (0.524, 1.2), (1.049, 5.3), (2.097, 6.9)],
+    4: [(0.016, 0.2), (0.033, 0.2), (0.066, 0.4), (0.131, 0.6), (0.262, 0.8), (0.524, 1.0), (1.049, 1.0), (2.097, 5.5)],
+})
+_ISO_AR_REF = 1.0           # _iso_ar_bw(n_local=4, ~1.05 MB): the ar_bw_gbs anchor (measured)
 
 
 def _row_bw(row, msg_mb: float) -> float:
@@ -728,21 +806,54 @@ def optimal_layer_split(m: ModelSpec, hw: HardwareSpec, w: Workload, tp: int,
     return ls
 
 
-def decode_weight_of(w: Workload) -> float:
-    """Fraction of wall time expected in decode (heuristic from token counts)."""
-    decode_tokens = w.out_len
-    prefill_tokens_equiv = w.in_len / 12   # prefill ~12× faster per token
-    return decode_tokens / (decode_tokens + prefill_tokens_equiv)
+def decode_weight_of(w: Workload, m: "ModelSpec" = None, hw: "HardwareSpec" = None) -> float:
+    """Fraction of wall time in decode. Derived from the cost model's OWN predicted
+    phase times at the uniform TP=world config (no magic constant) — this is what the
+    marginal-cost blend in optimal_*_split must weight by. When membw (decode) and
+    TFLOPS (prefill) hardware ratios diverge, the correct split follows the DOMINANT
+    phase, so the weight must be the real time share, not a token heuristic.
+    (Legacy token heuristic kept only as a fallback when m/hw are not supplied.)"""
+    if m is None or hw is None:
+        return w.out_len / (w.out_len + w.in_len / 12)
+    world = hw.world
+    if m.n_q % world == 0:
+        cfg = Config(world, 1, [m.n_layers], [m.ffn_dim // world] * world,
+                     [m.n_q // world] * world, [max(1, m.n_kv // world)] * world)
+    else:
+        cfg = Config(1, 1, [m.n_layers], [m.ffn_dim], [m.n_q], [max(1, m.n_kv)])
+    r = predict(m, hw, w, cfg)
+    if not r.get("feasible"):
+        return w.out_len / (w.out_len + w.in_len / 12)
+    td, tp = r.get("t_decode_s", 0.0), r.get("t_prefill_s", 0.0)
+    return td / (td + tp) if (td + tp) > 0 else 1.0
 
 
 # ----------------------------------------------------------------------------
 # Search (spec §7)
 # ----------------------------------------------------------------------------
 
+_ETA_MODEL_WARNED = set()
+
+
+def _warn_eta_model(m: ModelSpec, hw: HardwareSpec):
+    """overlap_eta is MODEL-dependent (measured on hw.overlap_eta_model). Warn ONCE per
+    model if planning a DIFFERENT one, so a transferred eta is never silent. Multi-model
+    eval scripts (regret_eval/verify/check_consistency) share one hw and will surface this
+    for every non-matching model — an accepted simplification, now made explicit."""
+    key = hw.overlap_eta_model
+    if key and key in MODELS and MODELS[key].name != m.name and m.name not in _ETA_MODEL_WARNED:
+        _ETA_MODEL_WARNED.add(m.name)
+        print(f"[planner] NOTE: overlap_eta={hw.overlap_eta:.2f} measured on '{key}', planning "
+              f"'{m.name}' — eta is model-dependent (bigger model → higher eta); pp>1 predictions "
+              f"use a transferred eta. Re-run hardware_profiler.py --model for this model.",
+              file=sys.stderr)
+
+
 def plan(m: ModelSpec, hw: HardwareSpec, w: Workload, top_k: int = 10,
          overlap: bool = True):
+    _warn_eta_model(m, hw)
     world = hw.world
-    dw = decode_weight_of(w)
+    dw = decode_weight_of(w, m, hw)
     cands = []
 
     tp = world
@@ -777,10 +888,15 @@ def plan(m: ModelSpec, hw: HardwareSpec, w: Workload, top_k: int = 10,
         kv_u = [max(1, m.n_kv // tp_s)] * tp_s
         cands.append(Config(tp_s, pp, ls_uniform, ffn_u, heads_u, kv_u,
                             label=f"TP{tp_s}PP{pp} uniform"))
-        # optimal layer split (+ ±1 neighborhood)
+        # optimal layer split + neighborhood. The closed-form is only a starting
+        # point; we SEARCH so the actual pick is optimal even when membw/TFLOPS
+        # hardware ratios diverge (measured) and the closed-form is a few layers off
+        # (invariant #7). For pp==2 the stage0<->last shift is a FULL 1-D scan; for
+        # deeper pp we widen to ±8 around the closed-form (predict() is cheap, n_layers<=96).
         ls_opt = optimal_layer_split(m, hw, w, tp_s, pp, dw)
         seen = {tuple(ls_uniform)}
-        for delta in range(-3, 4):      # ±3 around the closed-form optimum
+        span = m.n_layers if pp == 2 else min(base, 8)
+        for delta in range(-span, span + 1):      # search around the closed-form
             ls = ls_opt[:]
             ls[0] += delta
             ls[-1] -= delta

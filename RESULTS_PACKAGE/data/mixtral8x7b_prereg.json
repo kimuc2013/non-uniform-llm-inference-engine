@@ -1,0 +1,229 @@
+{
+ "model": "mixtral8x7b",
+ "note": "PRE-REGISTERED predictions (frozen 2026-06-27, BEFORE any Mixtral measurement). Zero-refit generalization test.",
+ "workload": "balanced in=512 out=256",
+ "layouts": {
+  "4+4": {
+   "16": {
+    "champion": "TP8xPP1",
+    "champion_tps": 818,
+    "top3": [
+     [
+      "TP8xPP1",
+      818
+     ],
+     [
+      "TP8xPP1",
+      656
+     ],
+     [
+      "TP4xPP2",
+      614
+     ]
+    ]
+   },
+   "32": {
+    "champion": "TP8xPP1",
+    "champion_tps": 1330,
+    "top3": [
+     [
+      "TP8xPP1",
+      1330
+     ],
+     [
+      "TP8xPP1",
+      1123
+     ],
+     [
+      "TP4xPP2",
+      1119
+     ]
+    ]
+   },
+   "64": {
+    "champion": "TP4xPP2",
+    "champion_tps": 2139,
+    "top3": [
+     [
+      "TP4xPP2",
+      2139
+     ],
+     [
+      "TP4xPP2",
+      2090
+     ],
+     [
+      "TP4xPP2",
+      2011
+     ]
+    ]
+   },
+   "96": {
+    "champion": "TP4xPP2",
+    "champion_tps": 3095,
+    "top3": [
+     [
+      "TP4xPP2",
+      3095
+     ],
+     [
+      "TP4xPP2",
+      3035
+     ],
+     [
+      "TP4xPP2",
+      2921
+     ]
+    ]
+   }
+  },
+  "2+2": {
+   "16": {
+    "champion": "TP4xPP1",
+    "champion_tps": 555,
+    "top3": [
+     [
+      "TP4xPP1",
+      555
+     ],
+     [
+      "TP4xPP1",
+      402
+     ],
+     [
+      "TP2xPP2",
+      345
+     ]
+    ]
+   },
+   "32": {
+    "champion": "TP4xPP1",
+    "champion_tps": 1004,
+    "top3": [
+     [
+      "TP4xPP1",
+      1004
+     ],
+     [
+      "TP4xPP1",
+      741
+     ],
+     [
+      "TP2xPP2",
+      625
+     ]
+    ]
+   },
+   "64": {
+    "champion": "TP4xPP1",
+    "champion_tps": 1683,
+    "top3": [
+     [
+      "TP4xPP1",
+      1683
+     ],
+     [
+      "TP4xPP1",
+      1286
+     ],
+     [
+      "TP2xPP2",
+      1197
+     ]
+    ]
+   },
+   "96": {
+    "champion": "TP4xPP1",
+    "champion_tps": 2554,
+    "top3": [
+     [
+      "TP4xPP1",
+      2554
+     ],
+     [
+      "TP4xPP1",
+      1930
+     ],
+     [
+      "TP2xPP2",
+      1736
+     ]
+    ]
+   }
+  },
+  "1+1": {
+   "16": {
+    "champion": "TP2xPP1",
+    "champion_tps": 315,
+    "top3": [
+     [
+      "TP2xPP1",
+      315
+     ],
+     [
+      "TP1xPP2",
+      182
+     ],
+     [
+      "TP1xPP2",
+      181
+     ]
+    ]
+   },
+   "32": {
+    "champion": "TP2xPP1",
+    "champion_tps": 586,
+    "top3": [
+     [
+      "TP2xPP1",
+      586
+     ],
+     [
+      "TP1xPP2",
+      328
+     ],
+     [
+      "TP1xPP2",
+      326
+     ]
+    ]
+   },
+   "64": {
+    "champion": "TP2xPP1",
+    "champion_tps": 1058,
+    "top3": [
+     [
+      "TP2xPP1",
+      1058
+     ],
+     [
+      "TP1xPP2",
+      628
+     ],
+     [
+      "TP1xPP2",
+      624
+     ]
+    ]
+   },
+   "96": {
+    "champion": "TP2xPP1",
+    "champion_tps": 1544,
+    "top3": [
+     [
+      "TP2xPP1",
+      1544
+     ],
+     [
+      "TP1xPP2",
+      912
+     ],
+     [
+      "TP1xPP2",
+      906
+     ]
+    ]
+   }
+  }
+ }
+}

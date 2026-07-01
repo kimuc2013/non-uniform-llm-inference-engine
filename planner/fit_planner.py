@@ -1,3 +1,8 @@
+"""RETIRED 2026-07-01 — DO NOT USE. This fit the cost-model params to PRIOR SERVING
+throughput (tps/itl/ttft), which is forbidden: it is not a measurement and does not
+transfer to new hardware. Params are now MEASURED each deployment by hardware_profiler.py
+(fingerprint-cached measured_params.json). Kept only as historical reference.
+"""
 """Fit the planner's free parameters to calibration_data.csv.
 
 Free parameters (9):
