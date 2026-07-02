@@ -1,0 +1,15 @@
+{
+  "fitted": {
+    "ar_latency_us": 5.431068068045937,
+    "ar_bw_gbs": 5.1623197443568865,
+    "intra_ar_latency_us": 5.0,
+    "step_floor_ms": 1.7374591300591689,
+    "c_mb_ms": 0.34901973600231423,
+    "c_chunk_ms": 10.09204953708661,
+    "overlap_eta": 1.0,
+    "prefill_overlap": 0.46216751193813915,
+    "kv_bw_scale": 0.31622516429835373
+  },
+  "loss": 0.3122621199926273,
+  "note": "global fit on 4-model calibration + concurrency (n_req\u2264100), hierarchical AR; robust clipped-MAE loss over tps+itl+ttft"
+}
