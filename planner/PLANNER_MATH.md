@@ -357,3 +357,29 @@ and produced degenerate [31,1] layer splits for 8B; the honest point removes the
 degeneracy (8B now picks balanced splits) at a ~1pp aggregate regret cost
 (7.5%→8.6%) — the price of consistency, reported, not hidden. Exact point
 identification needs an n_mb-dependent η model or a third instrument.
+
+
+## 15. Serving per-AR surfaces and the small-model cross-node overhead term
+
+Four dedicated decode-clean twins (2026-07-02) identified the SERVING per-AR cost
+per (radix, message): n_local=2: 161 µs @1.05 MB (70B TP4@2+2, exact — the
+n_local=4-anchored model had charged 1038 µs, 6.4× too much, causing the 2+2
+TP4 crossover miss); n_local=4: 410 µs @512 KB (8B TP8), 924 µs @1.05 MB
+(graph-chain). The α–β split inside these totals is NOT identifiable (the
+2-point solve gives non-physical signs); the surface form avoids the split.
+Stored as `serving_per_ar_us_by_nlocal`.
+
+**Consumption is gated off** (`PLANNER_USE_SERVING_AR=1` to enable): with honest
+AR prices and no companion term, small-model cross-node TP becomes over-attractive
+(2+2 regret 2.8%→25.8%) because the small-model cross-node PER-STEP overhead —
+the phenomenon the retired fit patched as a ~48 ms "step floor" — is not yet a
+modeled term. The same twins already measure it (the 8B residual above the
+70B-anchored AR line: ~305−161 ≈ 144 µs/AR-equivalent at n₂, i.e. ~9 ms/step);
+promoting it to a per-(model, radix) overhead term with its own identification
+is the designated next step. Until then the n_local=4-anchored pricing (whose
+absorbed overhead cancels correctly in the dominant 4+4 evaluations) remains the
+operating point.
+
+Per-model η is now complete and monotone in model size — η(8B)=0.635,
+η(OPT-30B)=0.776, η(70B)=0.992 — each identified from its own PP twin with its
+measured engine floor F (8.23 / 12.14 / 9.99 ms).

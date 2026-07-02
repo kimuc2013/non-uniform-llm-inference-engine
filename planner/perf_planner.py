@@ -136,6 +136,7 @@ class HardwareSpec:
     # these over the scalars; the scalar is the deployment model's value / degraded fallback.
     engine_floor_by_model: tuple = ()   # ((model_name, F_ms), ...) — TP-only twin
     overlap_eta_by_model: tuple = ()    # ((model_name, eta), ...) — PP twin with measured F
+    serving_per_ar: tuple = ()          # ((n_local, ((msg_MB, per_AR_us), ...)), ...) — serving twins
     step_floor_ms: float = 1.5      # per-decode-step engine host floor. DEGRADED-mode default
                                     # only (operative value comes from measured_params; the
                                     # principled source is the per-model TP-only twin F, §9-10
@@ -283,6 +284,8 @@ def load_hardware(path: Path = HW_PARAMS) -> HardwareSpec:
                         for k, v in m.get("engine_floor_ms_by_model", {}).items()),
                   overlap_eta_by_model=tuple((MODELS[k].name if k in MODELS else k, float(v))
                         for k, v in m.get("overlap_eta_by_model", {}).items()),
+                  serving_per_ar=tuple((int(k), tuple((float(a), float(b)) for a, b in v))
+                        for k, v in m.get("serving_per_ar_us_by_nlocal", {}).items()),
                   prefill_overlap=m.get("prefill_overlap", 0.98),
                   step_floor_ms=m.get("step_floor_ms", 1.5), c_mb_ms=m.get("c_mb_ms", 1.5),
                   c_chunk_ms=m.get("c_chunk_ms", 5.0))
@@ -498,6 +501,24 @@ def t_allreduce_ms(msg_bytes: float, ranks: list, hw: HardwareSpec) -> float:
     # not survive. A radix-aware level scale was tried and REVERTED: with the APC
     # workload correction in place it worsened 2+2 regret 2.4%->4.5% (evaluation used
     # as validation of instrument transfer, not as a fit target).
+    # SERVING per-AR surface (measured 2026-07-02 via dedicated decode-clean twins,
+    # per radix x message): {n_local: [(msg_MB, per_AR_us)]}. This is the TOTAL cross-
+    # node per-AR cost measured in the serving instrument (c - F - roofline residual,
+    # 70B direct points authoritative; 8B small-msg points are upper bounds and are
+    # monotone-guarded). When present it REPLACES the alpha-beta formula for cross-node
+    # groups; nearest measured radix is used (only the cluster layouts' radices exist).
+    # GATED OFF pending the companion term: consuming this surface alone makes small-
+    # model cross-node TP over-attractive because the small-model cross-node PER-STEP
+    # overhead (the phenomenon the retired fit patched as a ~48ms "step floor") is not
+    # yet a modeled+measured term — with honest AR prices and no overhead term, 2+2
+    # regret degrades 2.8%->25.8%. The measurements stay in measured_params; enable via
+    # PLANNER_USE_SERVING_AR=1 once the overhead term is identified (next measurement:
+    # same twins, residual after the 70b-anchored AR is exactly that overhead).
+    _spa = dict(getattr(hw, "serving_per_ar", ()) or ())         if os.environ.get("PLANNER_USE_SERVING_AR", "0") == "1" else {}
+    if _spa:
+        _k = min(_spa, key=lambda x: abs(x - n_local))
+        _per_ar_us = _row_bw(_spa[_k], msg_bytes / 1e6)      # reuse log-interp helper
+        return _per_ar_us / 1e3
     _anchor_n = max(_ISO_AR_SURFACE)
     eff_ar_bw = hw.ar_bw_gbs * _row_bw(_ISO_AR_SURFACE[_anchor_n], msg_bytes / 1e6) / _ISO_AR_REF
     t_inter = (2 * (n_nodes - 1) / n_nodes * msg_bytes) / (eff_ar_bw * 1e9) * 1e3

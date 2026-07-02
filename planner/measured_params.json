@@ -183,7 +183,8 @@
   },
   "overlap_eta_by_model": {
     "70b": 0.992,
-    "8b": 0.635
+    "8b": 0.635,
+    "opt30b": 0.776
   },
   "intra_large_msg_surface": {
     "head_blackwell_4gpu": [
@@ -221,5 +222,36 @@
     "_note": "MEASURED 2026-07-02 graph_chain single-node B=64 L=80: NO intra hiding in a dependent [GEMV->AR] chain (0.95x). The pattern-C 'fully hidden' hypothesis was an artifact of the APC-contaminated eval cells, resolved by the workload correction instead."
   },
   "_workload_spec_finding": "CRITICAL (2026-07-02): the sweep harness sends IDENTICAL prompts to all n requests and vLLM automatic prefix caching is ON by default -> the shared prompt is prefilled ONCE. All uniform-shape sweep cells therefore measured prefill_unique_frac ~= 1/n workloads (prefill_heavy cells are ~decode-only in reality: opt30b n=96 TTFT 0.3-0.8s, decode fills the wall). Workload.prefill_unique_frac models this; eval scripts pass 1/n for uniform cells, 1.0 for mixed (varied shapes). FUTURE SWEEPS: give each request a unique prompt prefix (or --no-enable-prefix-caching) to measure true per-request prefill.",
-  "_twin_identification": "2026-07-02 n_mb-sweep twins (8b TP2PP2 head-only, mb=32 c=36.84ms / mb=16 c=33.02ms): joint (eta,c_mb) identification is UNDERDETERMINED (eta is n_mb-dependent -> the constant-eta 2-equation system is inconsistent; twin B beats even eta=1 under the n_mb-weight-stream model). MEASUREMENT-DERIVED BOUNDS: physical consistency (eta in [0,1] across twin A + both cross-node PP twins with a SHARED engine c_mb) requires c_mb >= 3.8ms (kills the 3.4us CUDA-submit assumption; the engine per-microbatch cost is milliseconds). Adopted point = BAND MINIMUM (weakest overlap consistent with all measurements; a selection RULE, not a fit): c_mb=3.83ms -> eta_8b=0.635, eta_70b=0.992 (each re-inverted from its own PP twin with measured F). Point identification needs an n_mb-dependent eta model or a third instrument (future)."
+  "_twin_identification": "2026-07-02 n_mb-sweep twins (8b TP2PP2 head-only, mb=32 c=36.84ms / mb=16 c=33.02ms): joint (eta,c_mb) identification is UNDERDETERMINED (eta is n_mb-dependent -> the constant-eta 2-equation system is inconsistent; twin B beats even eta=1 under the n_mb-weight-stream model). MEASUREMENT-DERIVED BOUNDS: physical consistency (eta in [0,1] across twin A + both cross-node PP twins with a SHARED engine c_mb) requires c_mb >= 3.8ms (kills the 3.4us CUDA-submit assumption; the engine per-microbatch cost is milliseconds). Adopted point = BAND MINIMUM (weakest overlap consistent with all measurements; a selection RULE, not a fit): c_mb=3.83ms -> eta_8b=0.635, eta_70b=0.992 (each re-inverted from its own PP twin with measured F). Point identification needs an n_mb-dependent eta model or a third instrument (future).",
+  "serving_per_ar_us_by_nlocal": {
+    "2": [
+      [
+        0.524,
+        161.0
+      ],
+      [
+        1.049,
+        161.0
+      ],
+      [
+        2.097,
+        322.0
+      ]
+    ],
+    "4": [
+      [
+        0.524,
+        410.0
+      ],
+      [
+        1.049,
+        924.0
+      ],
+      [
+        2.097,
+        1848.0
+      ]
+    ]
+  },
+  "_serving_ar_note": "SERVING per-AR (us) by (n_local, msg): identified from dedicated decode-clean twins 2026-07-02: 70b TP4@2+2 c=74.04 -> 161us@1.05MB (n2, exact); 8b TP4@2+2 c=31.10 -> 305us@512KB (n2, UPPER bound - includes small-model cross-node overhead; monotone guard keeps the direct 70b point, flooring small-msg at 161); 8b TP8@4+4 c=35.09 -> 410us@512KB (n4); graph_chain 924us@1.05MB (n4). >=2MB rows extrapolated linearly in V (bw-const). alpha-beta split is NOT identifiable from these points (non-physical signs) - the surface form avoids the split. opt30b eta=0.776 from its PP twin (c=47.76, F=12.14): eta ordering 8b 0.635 < opt30b 0.776 < 70b 0.992 monotone in size."
 }
