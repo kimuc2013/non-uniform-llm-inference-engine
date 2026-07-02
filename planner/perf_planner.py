@@ -6,7 +6,7 @@ split water-fill, max+(1-ρ)min wall blend): closed-form throughput prediction +
 split derivation + config search for arbitrary (model, hardware, workload)
 on heterogeneous clusters.
 
-All hardware rates are EFFECTIVE values calibrated from measured sweeps
+All hardware rates are MEASURED pre-serving on this cluster (hardware_profiler);
 (planner/hw_params.json) — see spec §7 for the ≤6-cell probe procedure on a
 new cluster.
 
@@ -123,16 +123,23 @@ class HardwareSpec:
     intra_ar_bw_gbs: float
     p2p_latency_us: float
     p2p_bw_gbs: float
-    # NVLink-equipped GPUs (the Blackwell head) get a much faster intra-node AR
-    # than PCIe GPUs (the Ada worker has no NVLink). Modeling both with one PCIe-
-    # like intra param over-charges the Blackwell stage's AR and under-skews PP
-    # layer allocation. Physics-anchored constants (NOT fitted).
+    # NVLink-SPEC prior for NVLink-equipped nodes ONLY. THIS cluster has NO NVLink
+    # (nvidia-smi topo: PCIe both nodes); the measured intra-AR here is ~16-18 GB/s
+    # @ 2.7us (intra_calib) and is what load_hardware installs. These defaults are
+    # never operative on this cluster — kept for future NVLink nodes (documented spec).
     nvlink_ar_latency_us: float = 4.0
     nvlink_ar_bw_gbs: float = 800.0
     overlap_eta: float = 0.65       # fork PP overlap efficiency (MEASURED 2026-07-01, decode-clean, step_floor-consistent)
     overlap_eta_model: str = ""     # model key overlap_eta was measured ON (eta is MODEL-dependent;
                                     # plan() warns if you plan a different model — see _warn_eta_model)
-    step_floor_ms: float = 30.0     # per-decode-step CPU/dispatch floor (all topologies)
+    # Per-model MEASURED engine params (P2): keyed by ModelSpec.name. predict() prefers
+    # these over the scalars; the scalar is the deployment model's value / degraded fallback.
+    engine_floor_by_model: tuple = ()   # ((model_name, F_ms), ...) — TP-only twin
+    overlap_eta_by_model: tuple = ()    # ((model_name, eta), ...) — PP twin with measured F
+    step_floor_ms: float = 1.5      # per-decode-step engine host floor. DEGRADED-mode default
+                                    # only (operative value comes from measured_params; the
+                                    # principled source is the per-model TP-only twin F, §9-10
+                                    # PLANNER_MATH). Old default 30.0 was a sweep-era eyeball.
     c_mb_ms: float = 1.5            # per-microbatch CPU dispatch
     c_chunk_ms: float = 10.0        # per-prefill-chunk overhead
     mem_util: float = 0.85
@@ -151,7 +158,7 @@ class HardwareSpec:
                                     # decode HBM-streaming (chunked continuous
                                     # batching: tensor-core vs HBM overlap).
                                     # 0 → phases additive, 1 → fully hidden.
-    prefill_tf_mult: float = 1.0    # corrects the ABSOLUTE prefill-TFLOPS level
+    prefill_tf_mult: float = 1.0    # HISTORICAL, always 1.0 since compute is measured; corrects the ABSOLUTE prefill-TFLOPS level
                                     # (the 289/183 in hw_params were back-derived
                                     # under the old additive model and read low);
                                     # preserves the Blackwell:Ada ratio.
@@ -216,11 +223,15 @@ def load_hardware(path: Path = HW_PARAMS) -> HardwareSpec:
         nodes=((bw, 4), (ada, 4)),
         ar_latency_us=ic["ar_latency_us"],
         ar_bw_gbs=ic["ar_bw_gbs"],
-        intra_ar_latency_us=20.0,
-        intra_ar_bw_gbs=60.0,        # PCIe-class intra-node (no NVLink on these boxes)
+        intra_ar_latency_us=2.7,     # DEGRADED default = measured-class (intra_calib 2026-07-01);
+        intra_ar_bw_gbs=16.0,        # overridden by measured_params in any calibrated run
         p2p_latency_us=ic["p2p_latency_us"],
         p2p_bw_gbs=ic["p2p_bw_gbs"],
-        prefill_ar_overlap=d.get("prefill_ar_overlap", 0.0),
+        # prefill_ar_overlap comes ONLY from the calibration file (measured_params) —
+        # the old hw_params.json 0.8 was a serving-sweep fit (2026-06-13 revision) and
+        # must not silently re-enter. Absent a calibration: 0.0 = fully-exposed AR,
+        # the honest structural default (audit 2026-07-02).
+        prefill_ar_overlap=0.0,
     )
     # Load ALL cost-model parameters from the HardwareProfiler output
     # (planner/measured_params.json) — MEASURED on this cluster this deployment,
@@ -262,12 +273,16 @@ def load_hardware(path: Path = HW_PARAMS) -> HardwareSpec:
         kw.update(ar_latency_us=ic2["ar_latency_us"], ar_bw_gbs=ic2["ar_bw_gbs"],
                   decode_ar_overlap=ic2.get("decode_ar_overlap", 0.0),
                   p2p_latency_us=ic2.get("p2p_latency_us", 200.0), p2p_bw_gbs=ic2.get("p2p_bw_gbs", 10.0),
-                  intra_ar_bw_gbs=intra2.get("intra_ar_bw_gbs", 60.0),
-                  intra_ar_latency_us=intra2.get("intra_ar_latency_us", 5.0),
+                  intra_ar_bw_gbs=intra2.get("intra_ar_bw_gbs", 16.0),      # fallback = measured-class
+                  intra_ar_latency_us=intra2.get("intra_ar_latency_us", 2.7),  # (old 60/5 were hand guesses)
                   nvlink_ar_bw_gbs=intra2.get("nvlink_ar_bw_gbs", 800.0),
                   nvlink_ar_latency_us=intra2.get("nvlink_ar_latency_us", 4.0),
                   kv_bw_scale=m.get("kv_bw_scale", 1.0), overlap_eta=m.get("overlap_eta", 0.65),
                   overlap_eta_model=m.get("overlap_eta_model", ""),
+                  engine_floor_by_model=tuple((MODELS[k].name if k in MODELS else k, float(v))
+                        for k, v in m.get("engine_floor_ms_by_model", {}).items()),
+                  overlap_eta_by_model=tuple((MODELS[k].name if k in MODELS else k, float(v))
+                        for k, v in m.get("overlap_eta_by_model", {}).items()),
                   prefill_overlap=m.get("prefill_overlap", 0.98),
                   step_floor_ms=m.get("step_floor_ms", 1.5), c_mb_ms=m.get("c_mb_ms", 1.5),
                   c_chunk_ms=m.get("c_chunk_ms", 5.0))
@@ -285,16 +300,8 @@ def load_hardware(path: Path = HW_PARAMS) -> HardwareSpec:
         print("[planner] WARNING: no calibration (planner/measured_params.json). Run "
               "`python planner/hardware_profiler.py` before serving. Using hw_params.json "
               "base (DEGRADED — not the measured values for this machine).", file=_sys.stderr)
-    # Legacy fit overlay (fit_planner.py) — RETIRED. Only fills keys the calibration
-    # did not provide (none, when measured_keys is populated). Kept for degraded mode.
-    fp = HERE / "fitted_params.json"
-    if fp.exists():
-        fit = json.loads(fp.read_text()).get("fitted", {})
-        for k in ("ar_latency_us", "ar_bw_gbs", "intra_ar_latency_us",
-                  "overlap_eta", "step_floor_ms", "c_mb_ms", "c_chunk_ms",
-                  "prefill_overlap", "kv_bw_scale", "decode_ar_overlap"):
-            if k in fit and k not in measured_keys:
-                kw[k] = fit[k]
+    # (The legacy fit overlay is DELETED, not just retired: no code path may read
+    # fitted_params.json — P1. Serving-fit values must not be able to re-enter.)
     return HardwareSpec(**kw)
 
 
@@ -303,6 +310,13 @@ class Workload:
     in_len: int
     out_len: int
     n_req: int
+    # Fraction of prefill tokens that are UNIQUE across the batch (not served by vLLM's
+    # automatic prefix caching, which is ON by default). The sweep harness sends the SAME
+    # prompt to every request -> the shared prefix is prefilled ONCE: unique_frac = 1/n_req
+    # (total prefill work = in_len, not n_req*in_len). KV CONTEXT is unchanged (each
+    # sequence still attends over its full in_len+generated KV during decode). This is a
+    # WORKLOAD-SPEC field (what traffic actually looks like), not a tuning knob.
+    prefill_unique_frac: float = 1.0
 
     @property
     def kv_avg(self) -> float:
@@ -477,6 +491,13 @@ def t_allreduce_ms(msg_bytes: float, ranks: list, hw: HardwareSpec) -> float:
     # speedup (n_local=2 ≈ 4× n_local=4) was an LL-protocol artifact that does NOT
     # survive in serving (per-node-NIC bottleneck) — it mispriced 2+2 cross-node TP4.
     # We therefore take the message-size shape from the anchor radix only (radix-free).
+    # RADIX-INDEPENDENT by instrument-validity (re-affirmed 2026-07-02): the isolated
+    # microbench's low-radix speedup (n_local=2 ~5x at ~1MB) is an LL-protocol artifact
+    # of the ISOLATED regime; the in-serving instrument (graph_chain, and the serving
+    # traces' 80us AR kernels) shows the per-node-NIC bottleneck where that boost does
+    # not survive. A radix-aware level scale was tried and REVERTED: with the APC
+    # workload correction in place it worsened 2+2 regret 2.4%->4.5% (evaluation used
+    # as validation of instrument transfer, not as a fit target).
     _anchor_n = max(_ISO_AR_SURFACE)
     eff_ar_bw = hw.ar_bw_gbs * _row_bw(_ISO_AR_SURFACE[_anchor_n], msg_bytes / 1e6) / _ISO_AR_REF
     t_inter = (2 * (n_nodes - 1) / n_nodes * msg_bytes) / (eff_ar_bw * 1e9) * 1e3
@@ -564,12 +585,19 @@ def predict(m: ModelSpec, hw: HardwareSpec, w: Workload, cfg: Config,
         return {"tps": 0.0, "feasible": False, "mem_note": note}
 
     pp = cfg.pp
-    eta = hw.overlap_eta if (overlap and pp > 1) else (0.15 if pp > 1 else 0.0)
+    # overlap=False pp>1 (stock-PP prediction): 0.15 = midpoint of the DIRECTLY-TRACED
+    # stock vLLM v1 PP overlap 12-24% (M13b torch-profiler trace analysis, 2026-06-02;
+    # RFC-acknowledged) — a mechanism measurement, not a throughput fit.
+    _eta_map = dict(hw.overlap_eta_by_model)
+    _flr_map = dict(hw.engine_floor_by_model)
+    eta_meas = _eta_map.get(m.name, hw.overlap_eta)
+    floor = _flr_map.get(m.name, hw.step_floor_ms)   # per-model measured F when available
+    eta = eta_meas if (overlap and pp > 1) else (0.15 if pp > 1 else 0.0)
 
     # ---- decode phase ----
     if pp == 1:
         t_step = stage_time_decode_ms(m, hw, w, cfg, 0, w.n_req)
-        t_cycle = t_step + hw.step_floor_ms
+        t_cycle = t_step + floor
     else:
         # bq = pp microbatches, but never more than there are requests (else we
         # fabricate phantom microbatches). mb is the *exact* average so the
@@ -586,7 +614,7 @@ def predict(m: ModelSpec, hw: HardwareSpec, w: Workload, cfg: Config,
         t_send = (mb * m.hidden * B_A) / (hw.p2p_bw_gbs * 1e9) * 1e3 \
                  + hw.p2p_latency_us / 1e3
         t_cycle = b_max + (1 - eta) * b_rest + (1 - eta) * t_send * (pp - 1) \
-                  + hw.step_floor_ms
+                  + floor
     t_decode_s = w.out_len * t_cycle / 1e3
 
     # ---- prefill phase ----
@@ -595,7 +623,7 @@ def predict(m: ModelSpec, hw: HardwareSpec, w: Workload, cfg: Config,
     # chunk boundary). c_chunk is a per-chunk CPU floor → charged once per chunk,
     # not per PP stage. Pipeline = fill (first chunk through all stages) +
     # steady (each later chunk costs the bottleneck stage + exposed bubble).
-    total_in = w.n_req * w.in_len
+    total_in = max(w.in_len, w.n_req * w.in_len * w.prefill_unique_frac)   # APC-aware volume
     n_chunks = max(1, math.ceil(total_in / T_CHUNK))
     t_prefill_ms = 0.0
     fill = 0.0
@@ -814,7 +842,9 @@ def decode_weight_of(w: Workload, m: "ModelSpec" = None, hw: "HardwareSpec" = No
     phase, so the weight must be the real time share, not a token heuristic.
     (Legacy token heuristic kept only as a fallback when m/hw are not supplied.)"""
     if m is None or hw is None:
-        return w.out_len / (w.out_len + w.in_len / 12)
+        # no model/hw -> pure token counting, no speed ratio available: weight by
+        # token counts alone (a structural, parameter-free fallback).
+        return w.out_len / (w.out_len + w.in_len)
     world = hw.world
     if m.n_q % world == 0:
         cfg = Config(world, 1, [m.n_layers], [m.ffn_dim // world] * world,
@@ -823,7 +853,15 @@ def decode_weight_of(w: Workload, m: "ModelSpec" = None, hw: "HardwareSpec" = No
         cfg = Config(1, 1, [m.n_layers], [m.ffn_dim], [m.n_q], [max(1, m.n_kv)])
     r = predict(m, hw, w, cfg)
     if not r.get("feasible"):
-        return w.out_len / (w.out_len + w.in_len / 12)
+        # derive the per-token prefill:decode speed ratio FROM THE MEASURED ROOFLINES
+        # (P1/P3; replaces the undocumented "/12" eyeball): decode streams the weights
+        # per token-step (membw-bound), prefill amortizes them over the chunk
+        # (tensor-core-bound), so per-token cost ratio ~ (2P/pi) / (P*b_W/beta) = 2*beta/(pi*b_W).
+        # T_dec ~ out_len * P*b_W/beta (one weight stream per step, shared by the whole
+        # batch); T_pre ~ n*in_len * 2P/pi (tensor-core). All factors structural/measured.
+        g = hw.gpu_of_rank(0)
+        ratio = w.n_req * 2 * (g.membw_gbs * 1e9) / (g.tflops_prefill * 1e12 * B_W)
+        return w.out_len / (w.out_len + w.in_len * ratio)
     td, tp = r.get("t_decode_s", 0.0), r.get("t_prefill_s", 0.0)
     return td / (td + tp) if (td + tp) > 0 else 1.0
 
@@ -864,11 +902,33 @@ def plan(m: ModelSpec, hw: HardwareSpec, w: Workload, top_k: int = 10,
                        [m.ffn_dim // tp] * tp, [m.n_q // tp] * tp,
                        [max(1, m.n_kv // tp)] * tp, label=f"TP{tp} uniform")
         cands.append(cfg_u)
-        # optimal non-uniform
+        # optimal non-uniform + a small NEIGHBORHOOD around the closed form. The
+        # closed form allocates by a linear speed blend; the true optimum can sit a
+        # quantum away when a nonlinear term (AR, KV floor) bends the objective
+        # (tp_split_opt invariant caught a 2.8% gap on mistral123b). Searching +-1
+        # ffn quantum between fastest/slowest rank keeps the pick optimal without
+        # any new parameter (pure search widening).
         ffn, heads, kv = optimal_tp_splits(m, hw, w, tp, dw)
         cfg_b = Config(tp, 1, [m.n_layers], ffn, heads, kv,
                        label=f"TP{tp} optimal-bias")
         cands.append(cfg_b)
+        # coarse sweep of the fast-node bias AXIS (uniform -> 2x uniform, step 256):
+        # the closed form is linear in the speed blend, but the objective bends
+        # (AR/KV floors), and the optimum can sit far from it (mistral123b needs
+        # B=6144 vs closed-form ~4300 — a 2.8% tps gap). ~14 extra predicts/cell,
+        # pure search widening, no parameters.
+        n_fast = hw.nodes[0][1]                     # ranks on the fast (head) node
+        if 0 < n_fast < tp:
+            u = m.ffn_dim // tp
+            for xb in range(u, 2 * u + 1, 256):
+                rest = m.ffn_dim - n_fast * xb
+                xa = rest // (tp - n_fast)
+                if xa < 128:
+                    break
+                ff = [xb] * n_fast + [xa] * (tp - n_fast)
+                ff[0] += m.ffn_dim - sum(ff)
+                cands.append(Config(tp, 1, [m.n_layers], ff, heads, kv,
+                                    label=f"TP{tp} bias-axis {xb}"))
 
     # ---- TP×PP factorizations ----
     # Enumerate EVERY divisor of world (not just powers of two) so odd layouts

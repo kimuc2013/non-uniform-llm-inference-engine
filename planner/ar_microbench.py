@@ -12,7 +12,7 @@ Single-node (intra, TP4): --nnodes=1 --nproc_per_node=4.
 import os, torch, torch.distributed as dist
 
 HIDDEN = 8192          # Llama-70B hidden (AR message = batch*hidden*2 bytes)
-BATCHES = [1, 2, 4, 8, 16, 32, 64, 128]
+BATCHES = [int(x) for x in os.environ.get("AR_BATCHES", "1,2,4,8,16,32,64,128").split(",")]
 # AR_HIDDEN_SWEEP=1: fix batch, sweep hidden (4096=8B, 7168=opt30b, 8192=70B, 12288=Mistral
 # + neighbours of 7168) — to test whether hidden=7168 is itself NCCL-anomalous vs a smooth
 # bandwidth curve (i.e. opt30b's slow AR is the message/alignment, not overlap).

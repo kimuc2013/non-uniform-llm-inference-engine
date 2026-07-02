@@ -90,7 +90,11 @@ def eval_all(surface=None, verbose=False):
             il, ol = _IO[key]
             world = hg + wg
             hw = relayout(P.load_hardware(), hg, wg)
-            ranked = P.plan(P.MODELS[mk], hw, P.Workload(il, ol, n), top_k=1)
+            # Sweep harness sends IDENTICAL prompts; vLLM prefix caching (default ON)
+            # prefills the shared prompt ONCE -> unique prefill fraction = 1/n for
+            # uniform-shape cells. Mixed streams have varied shapes -> frac=1.0.
+            frac = 1.0 if wl == "mixed" else 1.0 / n
+            ranked = P.plan(P.MODELS[mk], hw, P.Workload(il, ol, n, prefill_unique_frac=frac), top_k=1)
             if not ranked:
                 continue
             pk = ranked[0][1]

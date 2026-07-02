@@ -32,8 +32,11 @@ def one_launch():
     for _ in range(500): torch.argmax(o,dim=-1)
     torch.cuda.synchronize(); return (time.perf_counter()-t0)/500*1e3
 lat=min(one_launch() for _ in range(5))
-step_floor=round(sub+0.3,2)          # graph submit + a small python/scheduler constant
-c_mb=round(max(0.1,lat*3),2)         # ~ a few launches of per-mb prep dispatch
-c_chunk=round(max(1.0,lat*20),2)     # ~ scheduler+prepare span (proxy, many small ops)
-print(f"# graph_submit_host={sub:.3f}ms  per_launch_host={lat:.3f}ms")
-print(f"MEASURED step_floor_ms={step_floor} c_mb_ms={c_mb} c_chunk_ms={c_chunk}")
+# RAW measurements ONLY (audit 2026-07-02): the old derivation (+0.3ms "python constant",
+# lat*3, lat*20, max() floors) was hand magic — removed. The ENGINE host floor F is a
+# different physical quantity (scheduler+sampler python per step) and is identified by
+# the per-model TP-only twin (extract_overlap_eta pp=1), NOT by this probe. This probe
+# measures the CUDA-side host costs: c_mb ~= one extra graph-replay submit per microbatch
+# (structural count: 1), and the per-launch latency for structural-count derivations.
+print(f"MEASURED_RAW graph_submit_host_ms={sub:.4f} per_launch_host_ms={lat:.4f}")
+print(f"MEASURED c_mb_ms={round(sub,4)}")   # = 1 replay submit per extra microbatch (structural)

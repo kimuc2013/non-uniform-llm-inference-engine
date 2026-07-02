@@ -145,48 +145,30 @@ def _ar_latency_from_surface(surface):
 
 
 def measure_dispatch(log):
-    """PRIOR (probe TODO): step_floor/c_mb/c_chunk should be per-kernel-launch host
-    latency x model-structural counts. The launch-latency probe is NOT yet implemented,
-    so these are documented PRIOR values (regret-invariant on the eval set). NOT measured."""
-    log("  dispatch: PRIOR values (launch-latency probe TODO — NOT measured this run)")
-    return {"step_floor_ms": 1.5, "c_mb_ms": 1.5, "c_chunk_ms": 5.0}
-
-
-def measure_surface(log):
-    """MEASURE the cross-node AR bandwidth surface (n_local x message) via ar_microbench
-    at nproc_per_node in {1,2,4}, this deployment. Returns {n_local: [[msg_MB, bw], ...]}."""
-    out = subprocess.run(["bash", str(HERE / "run_surface_calib.sh")],
-                         capture_output=True, text=True, timeout=800).stdout
-    surf = {}
-    for ln in out.splitlines():
-        p = ln.split()
-        if len(p) == 4 and p[0] == "SURFACE":     # SURFACE <n_local> <msg_MB> <bw>
-            surf.setdefault(p[1], []).append([float(p[2]), float(p[3])])
-    if surf:
-        log(f"  AR surface MEASURED: n_local rows {sorted(surf)}")
-        return {k: v for k, v in surf.items()}
-    log("  AR surface: measure failed -> reuse cached _ISO_AR_SURFACE")
-    return None
-
-
-def measure_intra(log):
-    """MEASURE intra-node AR (single-node graph-chain/surface, serving NCCL env, per node).
-    NO NVLink assumption — reads the topology's real intra-AR bw + per-hop latency for
-    each node type. run_intra_calib.sh handles the ray-stop/restore + fit."""
-    out = subprocess.run(["bash", str(HERE / "run_intra_calib.sh")],
-                         capture_output=True, text=True, timeout=600).stdout
-    vals = {}
-    for ln in out.splitlines():
-        p = ln.split()
-        if len(p) == 4 and p[0] == "INTRA":       # INTRA <head|worker> <bw> <alpha_us>
-            vals[p[1]] = (float(p[2]), float(p[3]))
-    if "head" in vals and "worker" in vals:
-        hb, ha = vals["head"]; wb, wa = vals["worker"]
-        log(f"  intra-AR MEASURED: head {hb} GB/s a{ha}us, worker {wb} GB/s a{wa}us (PCIe, no NVLink)")
-        return {"nvlink_ar_bw_gbs": hb, "nvlink_ar_latency_us": ha,
-                "intra_ar_bw_gbs": wb, "intra_ar_latency_us": wa}
-    log("  intra-AR: measure failed -> PRIOR (60/5/800/4)")
-    return {"intra_ar_bw_gbs": 60.0, "intra_ar_latency_us": 5.0, "nvlink_ar_bw_gbs": 800.0, "nvlink_ar_latency_us": 4.0}
+    """MEASURE the CUDA-side host dispatch costs (raw probe, every mode): graph-replay
+    submit latency and per-launch latency. c_mb = one extra replay submit per microbatch
+    (structural count = 1). The ENGINE host floor F (scheduler+sampler python per step) is
+    a DIFFERENT quantity — identified per-model by the TP-only twin (measure_engine_floor);
+    the step_floor returned here is only the raw submit lower bound for degraded mode.
+    c_chunk: engine prepare-span per chunk — trace extraction TODO; interim = submit lower
+    bound (documented, honest lower bound, NOT the old fit-era 5.0)."""
+    try:
+        out = subprocess.run(["env", "CUDA_VISIBLE_DEVICES=0", HEAD_PY,
+                              str(HERE / "dispatch_microbench.py")],
+                             capture_output=True, text=True, timeout=180).stdout
+        m = re.search(r"MEASURED_RAW graph_submit_host_ms=([\d.]+) per_launch_host_ms=([\d.]+)", out)
+        if m:
+            sub, lat = float(m.group(1)), float(m.group(2))
+            log(f"  dispatch RAW MEASURED: graph_submit={sub}ms per_launch={lat}ms; "
+                f"c_mb={sub} (1 submit/mb, structural); step_floor/c_chunk = submit lower "
+                f"bound (engine floor F comes from the TP-only twin)")
+            return {"step_floor_ms": round(sub, 4), "c_mb_ms": round(sub, 4),
+                    "c_chunk_ms": round(sub, 4),
+                    "_dispatch_raw": {"graph_submit_host_ms": sub, "per_launch_host_ms": lat}}
+    except Exception as e:
+        log(f"  dispatch probe error {type(e).__name__}")
+    log("  dispatch: probe failed -> submit-scale lower bounds")
+    return {"step_floor_ms": 0.003, "c_mb_ms": 0.003, "c_chunk_ms": 0.003}
 
 
 def measure_overlap_eta(log, model_key="70b"):
@@ -293,6 +275,10 @@ def main():
         "intra": intra,   # MEASURED per-node intra-AR (no NVLink assumption; topology-real)
         "iso_ar_surface": surface,
         "prefill_overlap": prefill_overlap if prefill_overlap is not None else 0.98,
+        # prefill AR overlap: fit-era 0.8 RETIRED (audit 2026-07-02). Emitted every run so a
+        # fresh calibration cannot silently fall back to the hw_params fit value. 0.0 =
+        # fully-exposed AR (honest structural default) until graph_chain@prefill measures it.
+        "prefill_ar_overlap": 0.0,
         "overlap_eta": overlap_eta, "overlap_eta_model": args.model,   # eta is model-dependent
         "kv_bw_scale": 1.0, **disp,
         "_log": logs,
@@ -300,7 +286,10 @@ def main():
             "MEASURED": "membw, tflops (compute_microbench); ar_bw_gbs, decode_ar_overlap (graph_chain); "
                         "iso_ar_surface, ar_latency_us (ar_microbench); prefill_overlap (gemm probe); "
                         "overlap_eta (fork PP-overlap trace, thorough mode).",
-            "DERIVED_from_measured": "step_floor/c_mb/c_chunk (kernel-launch probe x structural counts).",
+            "DERIVED_from_measured": "c_mb (raw submit probe x structural 1-submit-per-mb). "
+                                     "step_floor: per-model engine floor F from the TP-only twin "
+                                     "(thorough); otherwise raw submit lower bound. c_chunk: "
+                                     "trace-extraction TODO; interim submit lower bound.",
             "PRIOR_documented": "p2p (small PP-send effect), intra_ar (PCIe-class; topo shows no NVLink).",
             "NOT_fit": "No value fit to serving throughput; nothing hardcoded per-model.",
         },

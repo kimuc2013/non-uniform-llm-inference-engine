@@ -98,10 +98,19 @@ top-k by predicted tput. The reported pick is the raw argmax (no safety guard).
 
 | | quantity | source |
 |---|---|---|
-| **measured** (microbench) | per-GPU decode HBM bandwidth, prefill bf16 GEMM TFLOPS (per GPU type) | `compute_microbench.py` |
-| **measured** | isolated cross-node AllReduce bandwidth surface + per-hop latency intercept | `ar_microbench.py` |
-| **measured** | point-to-point send bw/latency (PP boundary) | microbench |
-| **fit** (least-squares on measured serving throughput) | `ar_bw_gbs` (effective in-serving AR bw), `decode_ar_overlap`, `overlap_eta`, `prefill_overlap`, `step_floor`, `c_mb`, `c_chunk`, `kv_bw_scale`, `ar_latency_us` | `fit_planner.py` → `fitted_params.json` |
+| **measured** (microbench) | per-GPU decode HBM bandwidth, prefill bf16 GEMM TFLOPS, device memory (per GPU type) | `compute_microbench.py`, nvidia-smi |
+| **measured** | isolated cross-node AllReduce surface + latency intercept; effective in-decode AR bw + `decode_ar_overlap` | `ar_microbench.py`, `graph_chain_ar_microbench.py` |
+| **measured** | intra-node AR bw/latency per node type (PCIe; no NVLink here) | `run_intra_calib.sh` |
+| **measured** | `prefill_overlap` (phase blend), raw dispatch (submit/launch) → `c_mb` | `prefill_overlap_microbench.py`, `dispatch_microbench.py` |
+| **measured, per deployment model** | engine host floor `F` (TP-only twin) and PP overlap `eta` (PP twin) — two dedicated pre-serving runs, algebraically exact identification | `verify_pp_overlap_torch_profiler.py` + `extract_overlap_eta.py` |
+| **documented prior** | `p2p` bw/latency (nominal, conservative NCCL send/recv allowance — NOT measured, NOT fit; bounded effect); `c_chunk` (trace-extraction TODO; submit lower bound) | `hardware_profiler.py` |
+| **pending measurement** | `prefill_ar_overlap` (graph_chain @ prefill shape; the old 0.8 was a serving-fit value and is retired) | — |
+
+**The serving fit is GONE**: `fit_planner.py`/`fitted_params.json` are retired out of the
+load path entirely (`planner/legacy_fit/`); no code path can read them. Served sweep data
+is used ONLY as evaluation ground truth (oracle/regret). The definitive mathematical
+specification (equations, identification procedure, provenance ledger) is
+**`PLANNER_MATH.md`** in this package.
 
 **Removed constants:** `AR_EFFECTIVE_FACTOR = 3.74` (a hand-typed multiplier that
 faked the effective AR bandwidth) and the **per-radix surface shape** for the

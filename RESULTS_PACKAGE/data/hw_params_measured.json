@@ -49,12 +49,10 @@
     "  prefill_overlap=0.98"
   ],
   "_provenance": {
-    "MEASURED": "blackwell/ada eff_tflops_prefill + eff_membw_decode_gbs (compute_microbench); mem_gb (nvidia-smi 97887/49140 MiB); interconnect ar_bw_gbs+decode_ar_overlap (graph_chain_ar_microbench); iso_ar_surface + ar_latency_us (ar_microbench cross-node, monotonized for the cost model); prefill_overlap (gemm probe); intra AR bw+latency (intra_calib, PCIe / no NVLink); ",
-    "PRIOR_documented": "interconnect p2p (small PP-send, IB-class); step_floor_ms/c_mb_ms/c_chunk_ms (host-launch/dispatch floors \u2014 documented priors, regret-invariant, kernel-launch probe TODO); prefill_ar_overlap=0.8 (Megatron async-TP / sequence-parallel: cross-node TP AllReduce largely hidden under prefill GEMMs \u2014 LITERATURE prior, NOT measured NOT fit; graph_chain@prefill-batch measurement is a TODO).",
-    "MODEL_dependence": "overlap_eta is MODEL-dependent, measured on overlap_eta_model. All OTHER params are HARDWARE-only (fingerprint-cached). perf_planner._warn_eta_model warns when a different model is planned with the transferred eta.",
-    "NOT_fit": "No value fit to serving throughput; fit_planner.py retired. The former prefill_ar_overlap free-parameter fit (hw_params.json =0.8) is SUPERSEDED by the async-TP literature prior of like magnitude, now sourced from THIS file and labelled a prior.",
-    "_assembly_note": "Assembled across a mode=default profiler run (compute/AR/surface/intra/prefill_overlap/dispatch) PLUS a separate manual decode-clean overlap_eta measurement. `hardware_profiler.py --mode thorough --model 70b` reproduces all of it in one run.",
-    "overlap_eta_CAVEAT": "overlap_eta=0.65 is an EFFECTIVE cost-model pipeline-efficiency param, NOT a direct overlap measurement: it is the eta that makes t_cycle reproduce the MEASURED 70B TP4PP2 decode itl (62.83ms, decode-clean run results/verify_pp_overlap_20260701_181807, roofline step_floor-consistent inversion). The fork's ACTUAL cross-stage PP overlap is 56-78% (direct torch-profiler trace analysis, separate). The roofline inversion is CONFOUNDED for comm-bound small models (8B TP4PP2 GPU time is ~90% NCCL AllReduce/PP SendRecv, not compute) \u2014 it returns 0 there, which is a measurement artifact, NOT 'no overlap'. Do NOT extrapolate this 70B scalar to small models; perf_planner._warn_eta_model flags cross-model use. Direct-trace overlap is the correct measure for small models."
+    "MEASURED": "compute roofline+mem_gb (microbench/nvidia-smi); iso_ar_surface+ar_latency (ar_microbench, monotonized); ar_bw+decode_ar_overlap (graph_chain); intra AR (intra_calib); prefill_overlap 0.98 (gemm probe); c_mb 0.0034 raw submit x structural 1/mb (dispatch probe); engine_floor_ms_by_model {8b:8.23, 70b:9.99, opt30b:12.14} = TP-only twins (c1 - roofline, head-only TP4PP1 2026-07-02); overlap_eta_by_model {70b:0.775, 8b:0.0 (raw -1.38, clamped)} = PP twins with measured F (two-run exact identification, PLANNER_MATH \u00a79); prefill_ar_overlap 0.0 = graph_chain @ prefill shape B=2048 intra 4-GPU (exposed 2698.7us ~= isolated 2650.7us, boost 0.98x: vLLM inference TP-AR is in-stream synchronous, NO async-TP hiding \u2014 the old 0.8 was a serving-fit artifact, now RETIRED).",
+    "PRIOR_documented": "p2p 200us/10GB/s (nominal conservative NCCL send/recv allowance \u2014 bounded effect); c_chunk 0.0034 submit lower bound (engine prepare-span trace extraction TODO).",
+    "KNOWN_LIMITS": "(1) eta(8b) raw -1.38: the pp=2 step carries per-microbatch ENGINE cost not present in the pp=1 twin and degenerate with eta in one equation; needs an n_mb-sweep third run to identify c_mb(engine) separately. Clamped eta=0 under-predicts 8b PP steps ~7ms. (2) prefill_ar_overlap measured intra-node; cross-node same-mechanism expected ~0, verify when worker frees. (3) opt30b PP-twin (eta) pending worker availability.",
+    "NOT_fit": "fit_planner/fitted_params retired to legacy_fit/ and DELETED from the load path; no parameter descends from served sweep data. Serving results are evaluation-only."
   },
   "iso_ar_surface": {
     "1": [
@@ -166,11 +164,62 @@
     "nvlink_ar_bw_gbs": 18.0,
     "nvlink_ar_latency_us": 2.7
   },
-  "overlap_eta": 0.65,
+  "overlap_eta": 0.992,
   "kv_bw_scale": 1.0,
-  "step_floor_ms": 1.5,
-  "c_mb_ms": 1.5,
-  "c_chunk_ms": 5.0,
+  "step_floor_ms": 9.99,
+  "c_mb_ms": 3.83,
+  "c_chunk_ms": 0.0034,
   "overlap_eta_model": "70b",
-  "prefill_ar_overlap": 0.8
+  "prefill_ar_overlap": 0.0,
+  "engine_floor_ms_by_model": {
+    "8b": 8.23,
+    "70b": 9.99,
+    "opt30b": 12.14
+  },
+  "step_floor_model": "70b",
+  "_dispatch_raw": {
+    "graph_submit_host_ms": 0.0034,
+    "per_launch_host_ms": 0.0053
+  },
+  "overlap_eta_by_model": {
+    "70b": 0.992,
+    "8b": 0.635
+  },
+  "intra_large_msg_surface": {
+    "head_blackwell_4gpu": [
+      [
+        1.049,
+        9.8
+      ],
+      [
+        4.194,
+        12.0
+      ],
+      [
+        16.777,
+        12.5
+      ],
+      [
+        33.554,
+        12.6
+      ],
+      [
+        67.109,
+        12.7
+      ],
+      [
+        117.441,
+        12.7
+      ]
+    ],
+    "_note": "MEASURED 2026-07-02 (single-node ar_microbench, plain timing). Intra AR SATURATES ~12.7 GB/s at large msgs (no NCCL large-msg cliff intra-node). Serving-trace cross-check: 3250 AllReduce kernels in the 8B TP4PP1 trace, median 80us @512KB = 9.81 GB/s == bench. Wiring into t_allreduce_ms intra branch deferred: after the APC workload correction the prefill AR volume is small; flat decode-size level is within ~25% of the surface everywhere. Worker(Ada) surface pending (GPUs busy)."
+  },
+  "intra_decode_chain": {
+    "iso_per_ar_us": 112.8,
+    "exposed_per_ar_us": 119.0,
+    "boost": 0.95,
+    "_note": "MEASURED 2026-07-02 graph_chain single-node B=64 L=80: NO intra hiding in a dependent [GEMV->AR] chain (0.95x). The pattern-C 'fully hidden' hypothesis was an artifact of the APC-contaminated eval cells, resolved by the workload correction instead."
+  },
+  "_workload_spec_finding": "CRITICAL (2026-07-02): the sweep harness sends IDENTICAL prompts to all n requests and vLLM automatic prefix caching is ON by default -> the shared prompt is prefilled ONCE. All uniform-shape sweep cells therefore measured prefill_unique_frac ~= 1/n workloads (prefill_heavy cells are ~decode-only in reality: opt30b n=96 TTFT 0.3-0.8s, decode fills the wall). Workload.prefill_unique_frac models this; eval scripts pass 1/n for uniform cells, 1.0 for mixed (varied shapes). FUTURE SWEEPS: give each request a unique prompt prefix (or --no-enable-prefix-caching) to measure true per-request prefill.",
+  "_twin_identification": "2026-07-02 n_mb-sweep twins (8b TP2PP2 head-only, mb=32 c=36.84ms / mb=16 c=33.02ms): joint (eta,c_mb) identification is UNDERDETERMINED (eta is n_mb-dependent -> the constant-eta 2-equation system is inconsistent; twin B beats even eta=1 under the n_mb-weight-stream model). MEASUREMENT-DERIVED BOUNDS: physical consistency (eta in [0,1] across twin A + both cross-node PP twins with a SHARED engine c_mb) requires c_mb >= 3.8ms (kills the 3.4us CUDA-submit assumption; the engine per-microbatch cost is milliseconds). Adopted point = BAND MINIMUM (weakest overlap consistent with all measurements; a selection RULE, not a fit): c_mb=3.83ms -> eta_8b=0.635, eta_70b=0.992 (each re-inverted from its own PP twin with measured F). Point identification needs an n_mb-dependent eta model or a third instrument (future)."
 }

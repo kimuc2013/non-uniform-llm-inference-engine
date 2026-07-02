@@ -1,11 +1,11 @@
 RAW planner (plan()[0]) vs uniform TP=world baseline.  cells (n>=32): 103
   [excluded: qwen32b — profiled fork PP-overlap serving gap, not a planner error (§8)]
   >= baseline (ties OK, 0.5% band): 96/103   baseline-losses: 7   worst -13.8%
-  mean uplift over baseline: +81.4%   wins >0.5%: 82 (mean +103%)
-    LOSS -13.8%  opt30b 1+1 balanced n=64  pick=TP1PP2 opt-6
-    LOSS -11.6%  mixtral8x7b 4+4 prefill_heavy n=32  pick=TP4PP2 opt-3
-    LOSS -10.5%  70b 2+2 balanced n=64  pick=TP2PP2 opt-10
-    LOSS -9.1%  8b 2+2 balanced n=32  pick=TP2PP2 opt-3
-    LOSS -8.5%  8b 4+4 in1024_out128 n=64  pick=TP4PP2 opt-4
-    LOSS -1.5%  mixtral8x7b 2+2 balanced n=32  pick=TP4 optimal-bias
-    LOSS -0.9%  mixtral8x7b 4+4 balanced n=32  pick=TP4PP2 opt-2
+  mean uplift over baseline: +89.9%   wins >0.5%: 95 (mean +98%)
+    LOSS -13.8%  opt30b 1+1 balanced n=64  pick=TP1PP2 opt-1
+    LOSS -11.6%  mixtral8x7b 4+4 prefill_heavy n=32  pick=TP4PP2 opt+0
+    LOSS -10.5%  70b 2+2 balanced n=64  pick=TP2PP2 opt-3
+    LOSS -9.1%  8b 2+2 balanced n=32  pick=TP2PP2 opt+0
+    LOSS -8.5%  8b 4+4 in1024_out128 n=64  pick=TP4PP2 opt+0
+    LOSS -4.9%  8b 2+2 mixed n=64  pick=TP2PP2 opt-2
+    LOSS -0.9%  mixtral8x7b 4+4 balanced n=32  pick=TP4PP2 opt+0

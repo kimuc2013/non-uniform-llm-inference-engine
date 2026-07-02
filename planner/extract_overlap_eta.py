@@ -1,13 +1,16 @@
 """Extraction of the EFFECTIVE cost-model pipeline-efficiency eta from a DEDICATED
 torch-profiler run (NOT serving-result cells / throughput fits).
 
-CAVEAT (do not over-read): this eta is the value that makes the cost model's t_cycle
-reproduce the MEASURED itl — it is NOT a direct cross-stage overlap measurement. It is
-reliable for COMPUTE-bound configs (70B TP4PP2: eta=0.65). It is CONFOUNDED for COMM-bound
-small models: 8B TP4PP2 GPU time is ~90% NCCL AllReduce / PP SendRecv (not compute), so the
-roofline inversion returns eta≈0 there as an ARTIFACT (not 'no overlap' — the fork's direct
-cross-stage overlap is 56-78% by torch-profiler trace analysis). For small models, measure
-overlap DIRECTLY from the trace (stage0/stage1 wall-clock concurrency), not via this inversion.
+TWO-RUN IDENTIFICATION (PLANNER_MATH.md §9): pp=1 twin identifies the per-model ENGINE
+FLOOR F = c1 − t_step (no eta term, no degeneracy); the pp=2 twin then identifies
+eta = 1 − (c2 − F − b_max)/(b_rest + t_send) with F known. Both runs are dedicated
+pre-serving calibration runs. With the MEASURED F (8B: 8.23 ms, 70B: 9.99 ms — engine
+floor is ~model-size-independent software cost, as expected) the earlier artifacts
+resolve: 70B eta = 0.87 (was 0.65 when the fit-descended floor 1.5 under-charged the
+step); 8B raw eta = −0.14 → clamp 0 (was −0.97 before F; the small residue is per-mb
+engine cost beyond the CUDA-submit c_mb). eta is still the cost model's EFFECTIVE
+exposure coefficient, not the direct cross-stage concurrency (that is 56-78% by direct
+trace analysis — a different, also-valid instrument).
 
 eta is MODEL-DEPENDENT, so this reads the run's model/split/workload from
 <out_dir>/run_meta.json and extracts eta for THAT model — the one being deployed.
@@ -113,13 +116,33 @@ def main():
 
     m = P.MODELS[mk]; hw = P.load_hardware()
     if not split:
-        split = [m.n_layers // 2, m.n_layers - m.n_layers // 2]
+        split = ([m.n_layers] if pp == 1 else
+                 [m.n_layers // 2, m.n_layers - m.n_layers // 2])
 
     c = read_itl_ms(OUT)
     if not c:
         print("no perf_summary.csv — cannot get step period c"); return 1
     print(f"model={mk} TP{tp}PP{pp} split={split}  |  step period c = {c:.2f} ms "
           f"(fresh run itl)\n")
+
+    if pp == 1:
+        # FLOOR-IDENTIFICATION twin: c1 = t_step(roofline) + floor, NO eta term.
+        # The engine host floor (scheduler+sampler+dispatch per step) is identified
+        # per-model without degeneracy — no prior, no magic constant.
+        w = P.Workload(n_req=n_req, in_len=in_len, out_len=out_len)
+        ffn = [m.ffn_dim // tp] * tp
+        head = [max(1, m.n_q // tp)] * tp
+        kv = [max(1, m.n_kv // tp)] * tp
+        cfg = P.Config(tp, 1, [m.n_layers], ffn, head, kv)
+        t_step = P.stage_time_decode_ms(m, hw, w, cfg, 0, n_req)
+        floor = c - t_step
+        print(f"--- engine floor (TP-only identification) ---")
+        print(f"  t_step(roofline TP{tp}) = {t_step:.2f} ms   floor = c - t_step = {floor:.2f} ms")
+        print(f"ENGINE_FLOOR_MS {max(0.0, floor):.3f}  (model={mk}, raw {floor:.3f})")
+        return 0
+
+    # optional argv[3] = measured engine floor from the TP-only twin (else hw prior)
+    floor_arg = float(sys.argv[3]) if len(sys.argv) > 3 else None
 
     # --- eta from the MODEL roofline b (what the cost formula multiplies) + measured c ---
     w = P.Workload(n_req=n_req, in_len=in_len, out_len=out_len)
@@ -134,14 +157,18 @@ def main():
     # invert the SAME forward formula the planner uses (perf_planner predict, pp=2):
     #   c = b_max + (1-eta)*(b_rest + t_send) + step_floor   -> subtract step_floor.
     # (omitting it biased eta LOW by step_floor/(b_rest+t_send).)
-    sf = hw.step_floor_ms
+    # step_floor: PREFER the per-model MEASURED engine floor (TP-only twin, argv[3]);
+    # hw.step_floor_ms is only the degraded fallback.
+    sf = floor_arg if floor_arg is not None else hw.step_floor_ms
+    if floor_arg is not None:
+        print(f"  (using MEASURED engine floor {sf:.2f} ms from the TP-only twin)")
     denom = b_rest + t_send
     eta = 1 - (c - sf - b_max) / denom if denom > 0 else 0.0
 
     print(f"--- eta (roofline b, model-consistent) ---")
     print(f"  roofline busy/stage = {[round(x,1) for x in busy]} ms   b_max={b_max:.1f} b_rest={b_rest:.1f}")
     print(f"  step_floor={sf:.1f}  t_send={t_send:.3f}  eta = 1-({c:.1f}-{sf:.1f}-{b_max:.1f})/({b_rest:.1f}+{t_send:.2f}) = {eta:.3f}")
-    tc = b_max + (1 - eta) * b_rest + (1 - eta) * t_send * (pp - 1) + hw.step_floor_ms
+    tc = b_max + (1 - eta) * b_rest + (1 - eta) * t_send * (pp - 1) + sf
     print(f"  check: model t_cycle at this eta = {tc:.1f} ms vs measured c = {c:.1f} ms")
 
     # --- corroboration: trace compute-only busy (independent of the roofline) ---

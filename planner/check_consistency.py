@@ -166,11 +166,14 @@ def c6_tp_split_opt():
         m = P.MODELS[mk]
         if m.n_q % 8: continue
         w = wl("balanced", 64); dw = P.decode_weight_of(w)
-        ffn, heads, kv = P.optimal_tp_splits(m, HW, w, 8, dw)
-        cf_opt = P.Config(8, 1, [m.n_layers], ffn, heads, kv)
-        r_opt = P.predict(m, HW, w, cf_opt)
-        if not r_opt["feasible"]: continue
-        best = r_opt["tps"]; best_lab = "closed-form"
+        # the planner's value = best over plan()'s ACTUAL TP-only candidate set
+        # (closed form + bias-axis sweep) — the decision path, same spirit as c7.
+        ranked = P.plan(m, HW, w, top_k=len(P.MODELS) * 40)
+        tp_only = [(t, c) for (t, c, _) in ranked if c.pp == 1]
+        if not tp_only: continue
+        best_plan = max(t for t, _ in tp_only)
+        r_opt = {"tps": best_plan, "feasible": True}
+        best = r_opt["tps"]; best_lab = "plan(TP-only)"
         # sweep FFN bias (keep heads uniform to isolate the FFN axis)
         hu = [m.n_q // 8] * 8; ku = [max(1, m.n_kv // 8)] * 8
         for xb in range(m.ffn_dim // 8, m.ffn_dim // 8 * 2 + 1, 256):
@@ -370,7 +373,9 @@ def c16_factorization_complete():
     v = []
     m = P.MODELS["mistral123b"]
     hw6 = relayout(HW, 3)               # 3+3, world=6
-    got = {(c.tp, c.pp) for _, c, _ in P.plan(m, hw6, wl("balanced", 16), top_k=50)}
+    # top_k must exceed the candidate pool (the bias-axis sweep widened it); this
+    # invariant tests ENUMERATION, not ranking position.
+    got = {(c.tp, c.pp) for _, c, _ in P.plan(m, hw6, wl("balanced", 16), top_k=400)}
     if not any(pp in (3, 6) for _, pp in got):
         v.append(f"3+3 mistral: no pp in {{3,6}} enumerated; got {sorted(got)}")
     return v

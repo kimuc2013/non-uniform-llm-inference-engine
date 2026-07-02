@@ -19,6 +19,7 @@ from collections import defaultdict
 
 HERE = Path(__file__).resolve().parent; sys.path.insert(0, str(HERE))
 import perf_planner as P
+MIXED_MEAN = {"8b": (1080, 483), "opt30b": (597, 540), "70b": (597, 540)}
 REPO = HERE.parent
 
 # Excluded from the aggregate planner-quality metric — NOT a planner error.
@@ -89,7 +90,16 @@ def main():
         es = list(cm.values())
         if len(es) < 3: continue
         world = hg + wg; m = P.MODELS[model]; hw = relayout(hw0, hg, wg)
-        w = P.Workload(es[0]["in_len"], es[0]["out_len"], n)
+        wl0 = es[0].get("workload", "")
+        if wl0 == "mixed":
+            # mixed records carry in_len=out_len=-1; use the stream's MEAN shape
+            # (same convention as regret_eval/plot_mixed). Varied prompts -> frac=1.
+            il, ol = MIXED_MEAN.get(model, (512, 512))
+            w = P.Workload(il, ol, n, prefill_unique_frac=1.0)
+        else:
+            # identical-prompt harness + vLLM prefix caching (default ON): the shared
+            # prompt is prefilled ONCE -> unique prefill fraction = 1/n.
+            w = P.Workload(es[0]["in_len"], es[0]["out_len"], n, prefill_unique_frac=1.0 / n)
         base = [e for e in es if e["tp"] == world and e["pp"] == 1 and "uniform" in e["label"]]
         if not base: continue
         bt = base[0]["tps"]

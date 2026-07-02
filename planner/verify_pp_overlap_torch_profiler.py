@@ -44,9 +44,19 @@ FFN_DIM = _SPEC.ffn_dim
 N_Q = _SPEC.n_q
 N_KV = _SPEC.n_kv
 
-TP = 4
-PP = 2                       # cross-node PP=2 on the 4+4 cluster — the PP config the planner evaluates
-LAYER_SPLIT = [N_LAYERS // 2, N_LAYERS - N_LAYERS // 2]   # uniform (eta ~ split-insensitive)
+# PP_OVERLAP_PP=1 runs the TP-only (TP=8 PP=1) FLOOR-IDENTIFICATION twin: with pp=1 the
+# cost model is c1 = t_step(roofline) + floor — NO eta term — so the engine host floor is
+# identified per-model WITHOUT degeneracy. The PP=2 run then identifies eta with floor
+# known:  eta = 1 - (c2 - floor - b_max)/(b_rest + t_send).  Two dedicated pre-serving
+# runs -> two unknowns, algebraically exact (no priors, no magic constants).
+PP = int(os.environ.get("PP_OVERLAP_PP", "2"))
+# PP_OVERLAP_TP overrides TP (default world=8). TP=4,PP=1 -> world=4 = HEAD-ONLY twin:
+# valid for the ENGINE-FLOOR identification F (engine host cost is a node-local
+# software property; the roofline t_step accounts for the TP4 compute), and runnable
+# while the worker node is busy.
+TP = int(os.environ.get("PP_OVERLAP_TP", str(8 // PP)))
+LAYER_SPLIT = ([N_LAYERS] if PP == 1 else
+               [N_LAYERS // 2, N_LAYERS - N_LAYERS // 2])   # uniform (eta ~ split-insensitive)
 N_REQ = int(os.environ.get("PP_OVERLAP_NREQ", "64"))   # env-tunable batch. mb_size=N_REQ/PP.
              # Small N_REQ -> tiny decode kernels -> GPU starves on Python dispatch (CPU-bound,
              # eta artefact ~0); larger N_REQ -> bigger GEMMs -> GPU-bound -> real overlap.
@@ -72,14 +82,15 @@ def _build_env(trace_dir):
     env["NCCL_NET_GDR_LEVEL"] = "2"
     env["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
     env["VLLM_USE_FLASHINFER_MOE"] = "0"
-    env["VLLM_PP_LAYER_PARTITION"] = ",".join(str(x) for x in LAYER_SPLIT)
     env["VLLM_TP_FFN_SPLITS"]  = ",".join(str(FFN_DIM // TP) for _ in range(TP))
     env["VLLM_TP_HEAD_SPLITS"] = ",".join(str(N_Q // TP) for _ in range(TP))
     env["VLLM_TP_KV_SPLITS"]   = ",".join(str(max(1, N_KV // TP)) for _ in range(TP))
-    env["VLLM_PP_SAMPLED_BROADCAST_STREAM"] = "1"
-    env["VLLM_PP_MICROBATCH"] = "1"
-    env["VLLM_PP_MICROBATCH_SIZE"] = str(N_REQ // PP)
-    env["VLLM_PP_BATCH_QUEUE_SIZE"] = str(PP)
+    if PP > 1:                                    # PP-overlap machinery only in the PP twin
+        env["VLLM_PP_LAYER_PARTITION"] = ",".join(str(x) for x in LAYER_SPLIT)
+        env["VLLM_PP_SAMPLED_BROADCAST_STREAM"] = "1"
+        env["VLLM_PP_MICROBATCH"] = "1"
+        env["VLLM_PP_MICROBATCH_SIZE"] = os.environ.get("PP_OVERLAP_MB_SIZE", str(N_REQ // PP))
+        env["VLLM_PP_BATCH_QUEUE_SIZE"] = str(PP)
     return env
 
 
@@ -139,6 +150,10 @@ def main():
         "--profiler-config.profiler=torch",
         f"--profiler-config.torch_profiler_dir={trace_dir}",
     ]
+    if MODEL_KEY in ("opt30b",):
+        # base LM without a chat template: /v1/chat/completions 400s without one.
+        # Same template the sweep infra uses (hetero_sweep.py).
+        cmd += ["--chat-template", str(REPO / "planner" / "base_chat_template.jinja")]
     fout = open(log_path, "w")
     proc = subprocess.Popen(cmd, env=env, stdout=fout, stderr=subprocess.STDOUT,
                             cwd=str(REPO), preexec_fn=os.setsid)
